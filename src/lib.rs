@@ -28,9 +28,10 @@ pub struct StepResult<S> {
 pub struct Trajectory<S, A> {
     pub states: Vec<S>,
     pub actions: Vec<A>,
-    pub log_probs: Vec<f32>, // Neural network's confidence for calculating loss
-    pub reward: f32,         // Total accumulated reward
-    pub is_interesting: bool, // Flag to keep this trajectory as a future mutation seed
+    pub action_indices: Vec<Vec<usize>>, // For Neural agents to re-forward correctly
+    pub log_probs: Vec<f32>,              // Neural network's confidence for calculating loss
+    pub reward: f32,                      // Total accumulated reward
+    pub is_interesting: bool,             // Flag to keep this trajectory as a future mutation seed
 }
 
 /// A priority-based storage for past trajectories.
@@ -97,8 +98,8 @@ pub trait NeuralAgent {
     type State;
     type Action;
 
-    /// Takes the current state and valid action mask, returns the chosen action and its log probability.
-    fn choose_action(&self, state: &Self::State, mask: &[bool]) -> (Self::Action, f32);
+    /// Takes the current state and valid action mask, returns the chosen action, indices (for multi-head), and its log probability.
+    fn choose_action(&self, state: &Self::State, mask: &[bool]) -> (Self::Action, Vec<usize>, f32);
 
     /// Triggers the backpropagation process using a batch of past experiences.
     fn learn_from_batch(&mut self, trajectories: &[Trajectory<Self::State, Self::Action>]);
@@ -130,6 +131,7 @@ where
             let mut current_traj = Trajectory {
                 states: Vec::new(),
                 actions: Vec::new(),
+                action_indices: Vec::new(),
                 log_probs: Vec::new(),
                 reward: 0.0,
                 is_interesting: false,
@@ -139,11 +141,12 @@ where
                 let state = self.env.get_state();
                 let mask = self.env.get_action_mask();
 
-                let (action, log_prob) = self.agent.choose_action(&state, &mask);
+                let (action, indices, log_prob) = self.agent.choose_action(&state, &mask);
                 let result = self.env.step(&action);
 
                 current_traj.states.push(state.clone());
                 current_traj.actions.push(action.clone());
+                current_traj.action_indices.push(indices);
                 current_traj.log_probs.push(log_prob);
                 current_traj.reward += result.reward;
 
@@ -185,12 +188,12 @@ where
 #[cfg(feature = "burn-backend")]
 pub mod burn_helpers {
     use burn::nn::{Linear, LinearConfig, Relu};
+    use burn::optim::{GradientsParams, Optimizer};
     use burn::prelude::*;
+    use burn::tensor::backend::AutodiffBackend;
     use rand::distr::{weighted::WeightedIndex, Distribution};
     use rand::rng;
 
-    /// 1. CORE BRAIN (MULTI-HEAD NEURAL NETWORK)
-    /// Supports n arbitrary output heads providing parameters for the action.
     #[derive(Module, Debug)]
     pub struct MultiHeadNet<B: Backend> {
         shared_layer_1: Linear<B>,
@@ -250,18 +253,26 @@ pub mod burn_helpers {
     }
 
     /// 3. AGENT WRAPPER (Automates all AI-related logic)
-    pub struct BurnAgent<B: Backend, T: ActionTranslator> {
+    pub struct BurnAgent<B: AutodiffBackend, T: ActionTranslator, O: Optimizer<MultiHeadNet<B>, B>> {
         pub net: MultiHeadNet<B>,
         pub translator: T,
+        pub optimizer: O,
+        pub learning_rate: f64,
         pub device: B::Device,
     }
 
     // Automatically implement the standard NeuralAgent from the core library.
-    impl<B: Backend, T: ActionTranslator> super::NeuralAgent for BurnAgent<B, T> {
+    impl<B: AutodiffBackend, T: ActionTranslator, O: Optimizer<MultiHeadNet<B>, B>> super::NeuralAgent
+        for BurnAgent<B, T, O>
+    {
         type State = Vec<f32>; // Input must be a float array
         type Action = T::TargetAction;
 
-        fn choose_action(&self, state: &Self::State, mask: &[bool]) -> (Self::Action, f32) {
+        fn choose_action(
+            &self,
+            state: &Self::State,
+            mask: &[bool],
+        ) -> (Self::Action, Vec<usize>, f32) {
             // 1. Convert Vec<f32> to Tensor [Batch=1, Features]
             let state_tensor =
                 Tensor::<B, 1>::from_data(state.as_slice(), &self.device).unsqueeze::<2>();
@@ -299,15 +310,90 @@ pub mod burn_helpers {
             // 4. Translate the array [0, 42, 1] into the system Enum using the translator
             let final_action = self.translator.translate(&selected_indices);
 
-            (final_action, total_log_prob)
+            (final_action, selected_indices, total_log_prob)
         }
 
         fn learn_from_batch(
             &mut self,
-            _trajectories: &[super::Trajectory<Self::State, Self::Action>],
+            trajectories: &[super::Trajectory<Self::State, Self::Action>],
         ) {
-            // (This part will be about 50 lines of Tensor math, saved for a later refinement step)
-            println!("Burn Backend: Optimizing weights (Updating Weights)...");
+            let batch_size = trajectories.len();
+            if batch_size == 0 {
+                return;
+            }
+
+            // STEP 1: Reconstruct Tensor Graph from memory
+            let mut loss_tensors = Vec::new();
+
+            for traj in trajectories {
+                // Skip invalid sequences
+                if traj.reward < 0.0 {
+                    continue;
+                }
+
+                let step_count = traj.states.len();
+                if step_count == 0 {
+                    continue;
+                }
+
+                // Use the total episode return as the weight for REINFORCE
+                let episode_return = traj.reward;
+                let reward_tensor = Tensor::<B, 1>::from_data([episode_return], &self.device);
+
+                // Re-forward pass for each step in the episode
+                for i in 0..step_count {
+                    let state = &traj.states[i];
+                    let action_indices = &traj.action_indices[i];
+
+                    let state_tensor = Tensor::<B, 1>::from_data(state.as_slice(), &self.device)
+                        .unsqueeze::<2>();
+
+                    // Forward pass with Autodiff enabled
+                    let head_logits = self.net.forward(state_tensor);
+
+                    // For each head, calculate the log probability of the action that was actually taken
+                    for (h, logits) in head_logits.into_iter().enumerate() {
+                        let probs = burn::tensor::activation::softmax(logits, 1);
+                        
+                        // Select the probability of the index that was chosen during the episode
+                        let chosen_index = action_indices[h];
+                        let chosen_index_tensor = Tensor::<B, 1, Int>::from_data(
+                            [chosen_index as i64], 
+                            &self.device
+                        ).unsqueeze::<2>();
+                        
+                        let chosen_prob = probs.gather(1, chosen_index_tensor);
+                        let log_prob = chosen_prob.log();
+
+                        // REINFORCE formula: Loss = - (Reward * LogProb)
+                        // This forces the network to increase Prob(Action) if Reward is high
+                        let step_loss = log_prob.mul(reward_tensor.clone().unsqueeze::<2>()).neg();
+                        loss_tensors.push(step_loss.reshape([1]));
+                    }
+                }
+            }
+
+            if loss_tensors.is_empty() {
+                return;
+            }
+
+            // STEP 2: Aggregate losses and calculate the mean
+            let total_loss = Tensor::cat(loss_tensors, 0).mean();
+
+            let loss_value = total_loss.clone().into_data().to_vec::<f32>().unwrap()[0];
+            println!(
+                "🧠 [Training] Backpropagating... Current Loss: {:.4}",
+                loss_value
+            );
+
+            // STEP 3: Trigger Backpropagation
+            let gradients = total_loss.backward();
+
+            // STEP 4: Update weights using the Optimizer
+            let grads = GradientsParams::from_grads(gradients, &self.net);
+            self.net = self.optimizer.step(self.learning_rate, self.net.clone(), grads);
+
+            println!("✅ Model weights updated! The AI is a bit smarter now.");
         }
     }
 }
