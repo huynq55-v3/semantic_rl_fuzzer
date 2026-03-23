@@ -51,9 +51,13 @@ impl<S: Clone, A: Clone> HybridReplayBuffer<S, A> {
     /// Pushes a new trajectory into the buffer. Removes the oldest if at capacity.
     pub fn push_trajectory(&mut self, traj: Trajectory<S, A>) {
         if self.memory.len() >= self.capacity {
-            // Simplified FIFO eviction.
-            // In a production environment, sort and evict the lowest reward first.
-            self.memory.remove(0);
+            // Tìm phần tử ĐẦU TIÊN là rác (không interesting) để đuổi
+            if let Some(idx) = self.memory.iter().position(|t| !t.is_interesting) {
+                self.memory.remove(idx);
+            } else {
+                // Nếu cả kho đều là tinh hoa (hiếm khi xảy ra), đành xóa cái cũ nhất
+                self.memory.remove(0); 
+            }
         }
         self.memory.push(traj);
     }
@@ -121,7 +125,7 @@ pub struct FuzzEngine<E: FuzzEnvironment, A: NeuralAgent<State = E::State, Actio
 impl<E: FuzzEnvironment, A: NeuralAgent<State = E::State, Action = E::Action>> FuzzEngine<E, A>
 where
     E::State: Clone,
-    E::Action: Clone,
+    E::Action: Clone + std::fmt::Debug,
 {
     /// Starts the main Reinforcement Learning fuzzing loop.
     pub fn run_fuzzing(&mut self, total_episodes: usize) {
@@ -151,11 +155,23 @@ where
                 current_traj.reward += result.reward;
 
                 if result.is_violated {
-                    println!(
-                        "🚨 [Episode {}] LOGIC BUG DETECTED! Terminating episode to save artifact.",
-                        episode
-                    );
+                    println!("🚨 [Episode {}] BẮT ĐƯỢC BUG LOGIC! Dừng ngay Hồi này!", episode);
                     current_traj.is_interesting = true;
+                    
+                    // GHI ARTIFACT RA Ổ CỨNG
+                    use std::fs;
+                    use std::io::Write;
+                    let _ = fs::create_dir_all("artifacts"); // Tạo thư mục nếu chưa có
+                    let filename = format!("artifacts/bug_ep_{}.txt", episode);
+                    let mut file = fs::File::create(&filename).unwrap();
+                    
+                    // In thẳng cái mảng Action (đã được Translate) ra file
+                    writeln!(file, "Chuỗi hành động làm sập hệ thống:").unwrap();
+                    for (i, a) in current_traj.actions.iter().enumerate() {
+                        writeln!(file, "{}. {:?}", i, a).unwrap();
+                    }
+                    println!("💾 Đã cất bằng chứng vào {}", filename);
+                    
                     break;
                 }
 
@@ -170,6 +186,24 @@ where
             if current_traj.reward > 0.0 {
                 current_traj.is_interesting = true;
             }
+
+            // IN RA NHẬT KÝ CHI TIẾT (Mỗi 50 Hồi)
+            if episode % 50 == 0 {
+                println!("\n🔍 [DEBUG Episode {}] Hé lộ Tâm hồn AI:", episode);
+                println!("  - Tổng Điểm (Reward): {:.2}", current_traj.reward);
+                println!("  - Độ dài chuỗi (Steps): {}", current_traj.actions.len());
+                println!("  - 3 Hành động cuối cùng AI đã chọn:");
+                
+                // Lấy 3 action cuối (hoặc ít hơn nếu chuỗi ngắn)
+                let tail_len = current_traj.actions.len().min(3);
+                let start_idx = current_traj.actions.len() - tail_len;
+                
+                for (i, action) in current_traj.actions[start_idx..].iter().enumerate() {
+                    let prob_percent = current_traj.log_probs[start_idx + i].exp() * 100.0;
+                    println!("      + Lệnh: {:?} (Tự tin: {:.2}%)", action, prob_percent);
+                }
+            }
+
             self.buffer.push_trajectory(current_traj);
 
             // Trigger Neural Network training if we have gathered enough episodes.
