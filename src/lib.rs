@@ -410,7 +410,7 @@ pub mod burn_helpers {
         head_sizes: &[usize],
         learning_rate: f64,
         translator: T,
-    ) -> BurnAgent<DefaultGpuBackend, T, burn::optim::Adam<MultiHeadNet<DefaultGpuBackend>>> {
+    ) -> BurnAgent<DefaultGpuBackend, T, impl Optimizer<MultiHeadNet<DefaultGpuBackend>, DefaultGpuBackend>> {
         let device = WgpuDevice::DefaultDevice;
 
         // Initialize the Multi-head Neural Network
