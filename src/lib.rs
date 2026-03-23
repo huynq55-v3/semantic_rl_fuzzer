@@ -188,11 +188,16 @@ where
 #[cfg(feature = "burn-backend")]
 pub mod burn_helpers {
     use burn::nn::{Linear, LinearConfig, Relu};
-    use burn::optim::{GradientsParams, Optimizer};
+    use burn::optim::{AdamConfig, GradientsParams, Optimizer};
     use burn::prelude::*;
     use burn::tensor::backend::AutodiffBackend;
+    use burn::backend::Autodiff;
+    use burn::backend::wgpu::{Wgpu, WgpuDevice};
     use rand::distr::{weighted::WeightedIndex, Distribution};
     use rand::rng;
+
+    /// Default GPU Backend for Intel Iris Xe or other WGPU-compatible GPUs.
+    pub type DefaultGpuBackend = Autodiff<Wgpu>;
 
     #[derive(Module, Debug)]
     pub struct MultiHeadNet<B: Backend> {
@@ -394,6 +399,32 @@ pub mod burn_helpers {
             self.net = self.optimizer.step(self.learning_rate, self.net.clone(), grads);
 
             println!("✅ Model weights updated! The AI is a bit smarter now.");
+        }
+    }
+
+    /// GPU AGENT FACTORY (FACADE)
+    /// Hides the complexity of Burn's backend and device initialization.
+    pub fn create_gpu_agent<T: ActionTranslator>(
+        input_size: usize,
+        hidden_size: usize,
+        head_sizes: &[usize],
+        learning_rate: f64,
+        translator: T,
+    ) -> BurnAgent<DefaultGpuBackend, T, burn::optim::Adam<MultiHeadNet<DefaultGpuBackend>>> {
+        let device = WgpuDevice::DefaultDevice;
+
+        // Initialize the Multi-head Neural Network
+        let net = MultiHeadNet::<DefaultGpuBackend>::new(&device, input_size, hidden_size, head_sizes);
+
+        // Initialize the Adam Optimizer
+        let optimizer = AdamConfig::new().init();
+
+        BurnAgent {
+            net,
+            translator,
+            optimizer,
+            learning_rate,
+            device,
         }
     }
 }
