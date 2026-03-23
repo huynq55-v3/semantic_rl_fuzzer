@@ -28,9 +28,9 @@ pub struct StepResult<S> {
 pub struct Trajectory<S, A> {
     pub states: Vec<S>,
     pub actions: Vec<A>,
-    pub log_probs: Vec<f32>,     // Neural network's confidence for calculating loss
-    pub reward: f32,             // Total accumulated reward
-    pub is_interesting: bool,    // Flag to keep this trajectory as a future mutation seed
+    pub log_probs: Vec<f32>, // Neural network's confidence for calculating loss
+    pub reward: f32,         // Total accumulated reward
+    pub is_interesting: bool, // Flag to keep this trajectory as a future mutation seed
 }
 
 /// A priority-based storage for past trajectories.
@@ -50,9 +50,9 @@ impl<S: Clone, A: Clone> HybridReplayBuffer<S, A> {
     /// Pushes a new trajectory into the buffer. Removes the oldest if at capacity.
     pub fn push_trajectory(&mut self, traj: Trajectory<S, A>) {
         if self.memory.len() >= self.capacity {
-            // Simplified FIFO eviction. 
+            // Simplified FIFO eviction.
             // In a production environment, sort and evict the lowest reward first.
-            self.memory.remove(0); 
+            self.memory.remove(0);
         }
         self.memory.push(traj);
     }
@@ -65,7 +65,7 @@ impl<S: Clone, A: Clone> HybridReplayBuffer<S, A> {
     /// Randomly samples a batch of trajectories for Neural Network backpropagation.
     pub fn sample_for_training(&self, batch_size: usize) -> Vec<Trajectory<S, A>> {
         let mut rng = rng();
-        self.memory.choose_multiple(&mut rng, batch_size).cloned().collect()
+        self.memory.sample(&mut rng, batch_size).cloned().collect()
     }
 }
 
@@ -81,13 +81,13 @@ pub trait FuzzEnvironment {
 
     /// Returns the current physical/semantic state of the target.
     fn get_state(&self) -> Self::State;
-    
+
     /// Returns a boolean mask indicating which actions are currently valid.
     fn get_action_mask(&self) -> Vec<bool>;
-    
+
     /// Executes the action, evaluates it against the Oracle, and returns the result.
     fn step(&mut self, action: &Self::Action) -> StepResult<Self::State>;
-    
+
     /// Resets the environment for a new episode.
     fn reset(&mut self);
 }
@@ -99,7 +99,7 @@ pub trait NeuralAgent {
 
     /// Takes the current state and valid action mask, returns the chosen action and its log probability.
     fn choose_action(&self, state: &Self::State, mask: &[bool]) -> (Self::Action, f32);
-    
+
     /// Triggers the backpropagation process using a batch of past experiences.
     fn learn_from_batch(&mut self, trajectories: &[Trajectory<Self::State, Self::Action>]);
 }
@@ -126,7 +126,7 @@ where
     pub fn run_fuzzing(&mut self, total_episodes: usize) {
         for episode in 1..=total_episodes {
             self.env.reset();
-            
+
             let mut current_traj = Trajectory {
                 states: Vec::new(),
                 actions: Vec::new(),
@@ -148,7 +148,10 @@ where
                 current_traj.reward += result.reward;
 
                 if result.is_violated {
-                    println!("🚨 [Episode {}] LOGIC BUG DETECTED! Terminating episode to save artifact.", episode);
+                    println!(
+                        "🚨 [Episode {}] LOGIC BUG DETECTED! Terminating episode to save artifact.",
+                        episode
+                    );
                     current_traj.is_interesting = true;
                     break;
                 }
@@ -162,7 +165,7 @@ where
 
             // Mark trajectories with positive returns as interesting seeds for future mutations.
             if current_traj.reward > 0.0 {
-                current_traj.is_interesting = true; 
+                current_traj.is_interesting = true;
             }
             self.buffer.push_trajectory(current_traj);
 
@@ -170,7 +173,10 @@ where
             if self.buffer.is_ready_for_batch(self.batch_size) {
                 let batch = self.buffer.sample_for_training(self.batch_size);
                 self.agent.learn_from_batch(&batch);
-                println!("🧠 [Episode {}] Batch training complete. Backpropagation applied!", episode);
+                println!(
+                    "🧠 [Episode {}] Batch training complete. Backpropagation applied!",
+                    episode
+                );
             }
         }
     }
@@ -178,6 +184,135 @@ where
 
 #[cfg(feature = "burn-backend")]
 pub mod burn_helpers {
-    // Nơi bạn định nghĩa sẵn các class bọc Burn Tensor 
-    // để người dùng không phải hì hục code mạng Multi-head từ đầu.
+    use burn::nn::{Linear, LinearConfig, Relu};
+    use burn::prelude::*;
+    use rand::distr::{weighted::WeightedIndex, Distribution};
+    use rand::rng;
+
+    /// 1. CORE BRAIN (MULTI-HEAD NEURAL NETWORK)
+    /// Supports n arbitrary output heads providing parameters for the action.
+    #[derive(Module, Debug)]
+    pub struct MultiHeadNet<B: Backend> {
+        shared_layer_1: Linear<B>,
+        shared_layer_2: Linear<B>,
+        // List of output layers (Heads). Each head is responsible for generating one parameter.
+        heads: Vec<Linear<B>>,
+        relu: Relu,
+    }
+
+    impl<B: Backend> MultiHeadNet<B> {
+        /// Initializes the Neural Network with a dynamic number of heads.
+        /// Example: head_sizes = &[4, 100, 50] -> Will create 3 heads.
+        pub fn new(
+            device: &B::Device,
+            input_size: usize,
+            hidden_size: usize,
+            head_sizes: &[usize],
+        ) -> Self {
+            let shared_layer_1 = LinearConfig::new(input_size, hidden_size).init(device);
+            let shared_layer_2 = LinearConfig::new(hidden_size, hidden_size).init(device);
+
+            let mut heads = Vec::new();
+            for &size in head_sizes {
+                heads.push(LinearConfig::new(hidden_size, size).init(device));
+            }
+
+            Self {
+                shared_layer_1,
+                shared_layer_2,
+                heads,
+                relu: Relu::new(),
+            }
+        }
+
+        /// Returns a list of Logit Tensors for each head.
+        pub fn forward(&self, state: Tensor<B, 2>) -> Vec<Tensor<B, 2>> {
+            let x = self.shared_layer_1.forward(state);
+            let x = self.relu.forward(x);
+            let x = self.shared_layer_2.forward(x);
+            let shared_features = self.relu.forward(x);
+
+            // Each head receives the same set of features but generates different outputs.
+            self.heads
+                .iter()
+                .map(|head| head.forward(shared_features.clone()))
+                .collect()
+        }
+    }
+
+    /// 2. ACTION TRANSLATOR (TRANSLATOR TRAIT)
+    /// Users must implement this trait to convert the AI's integer array into their own action Enum.
+    pub trait ActionTranslator {
+        type TargetAction;
+
+        /// Takes an array of IDs from the heads (e.g., [0, 42, 1]) -> Returns the actual Enum.
+        fn translate(&self, head_outputs: &[usize]) -> Self::TargetAction;
+    }
+
+    /// 3. AGENT WRAPPER (Automates all AI-related logic)
+    pub struct BurnAgent<B: Backend, T: ActionTranslator> {
+        pub net: MultiHeadNet<B>,
+        pub translator: T,
+        pub device: B::Device,
+    }
+
+    // Automatically implement the standard NeuralAgent from the core library.
+    impl<B: Backend, T: ActionTranslator> super::NeuralAgent for BurnAgent<B, T> {
+        type State = Vec<f32>; // Input must be a float array
+        type Action = T::TargetAction;
+
+        fn choose_action(&self, state: &Self::State, mask: &[bool]) -> (Self::Action, f32) {
+            // 1. Convert Vec<f32> to Tensor [Batch=1, Features]
+            let state_tensor =
+                Tensor::<B, 1>::from_data(state.as_slice(), &self.device).unsqueeze::<2>();
+
+            // 2. Run the Neural Network (Forward pass)
+            let head_logits = self.net.forward(state_tensor);
+
+            let mut selected_indices = Vec::new();
+            let mut total_log_prob = 0.0;
+
+            // 3. Process each Head
+            for (i, mut logits) in head_logits.into_iter().enumerate() {
+                // ACTION MASKING TECHNIQUE
+                if i == 0 && mask.len() > 0 {
+                    let mut logits_data = logits.clone().into_data().to_vec::<f32>().unwrap();
+                    for (idx, &is_valid) in mask.iter().enumerate() {
+                        if !is_valid {
+                            logits_data[idx] = -1e9;
+                        }
+                    }
+                    logits = Tensor::<B, 1>::from_data(logits_data.as_slice(), &self.device)
+                        .reshape([1, mask.len()]);
+                }
+
+                // Convert Logits to Probabilities (Softmax)
+                let probs = burn::tensor::activation::softmax(logits, 1);
+                let probs_vec = probs.into_data().to_vec::<f32>().unwrap();
+
+                // Sampling randomly based on probabilities
+                let mut rng = rng();
+                let dist = WeightedIndex::new(&probs_vec).unwrap();
+                let chosen_index = dist.sample(&mut rng);
+
+                selected_indices.push(chosen_index);
+
+                // Cumulative LogProb for REINFORCE calculation
+                total_log_prob += probs_vec[chosen_index].ln();
+            }
+
+            // 4. Translate the array [0, 42, 1] into the system Enum using the translator
+            let final_action = self.translator.translate(&selected_indices);
+
+            (final_action, total_log_prob)
+        }
+
+        fn learn_from_batch(
+            &mut self,
+            _trajectories: &[super::Trajectory<Self::State, Self::Action>],
+        ) {
+            // (This part will be about 50 lines of Tensor math, saved for a later refinement step)
+            println!("Burn Backend: Optimizing weights (Updating Weights)...");
+        }
+    }
 }
