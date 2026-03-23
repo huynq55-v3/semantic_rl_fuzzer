@@ -29,9 +29,9 @@ pub struct Trajectory<S, A> {
     pub states: Vec<S>,
     pub actions: Vec<A>,
     pub action_indices: Vec<Vec<usize>>, // For Neural agents to re-forward correctly
-    pub log_probs: Vec<f32>,              // Neural network's confidence for calculating loss
-    pub reward: f32,                      // Total accumulated reward
-    pub is_interesting: bool,             // Flag to keep this trajectory as a future mutation seed
+    pub log_probs: Vec<f32>,             // Neural network's confidence for calculating loss
+    pub reward: f32,                     // Total accumulated reward
+    pub is_interesting: bool,            // Flag to keep this trajectory as a future mutation seed
 }
 
 /// A priority-based storage for past trajectories.
@@ -51,20 +51,15 @@ impl<S: Clone, A: Clone> HybridReplayBuffer<S, A> {
     /// Pushes a new trajectory into the buffer. Removes the oldest if at capacity.
     pub fn push_trajectory(&mut self, traj: Trajectory<S, A>) {
         if self.memory.len() >= self.capacity {
-            // Tìm phần tử ĐẦU TIÊN là rác (không interesting) để đuổi
+            // Find the FIRST "trash" element (not interesting) to evict
             if let Some(idx) = self.memory.iter().position(|t| !t.is_interesting) {
                 self.memory.remove(idx);
             } else {
-                // Nếu cả kho đều là tinh hoa (hiếm khi xảy ra), đành xóa cái cũ nhất
-                self.memory.remove(0); 
+                // If the entire buffer consists of high-quality trajectories (rare), delete the oldest one
+                self.memory.remove(0);
             }
         }
         self.memory.push(traj);
-    }
-
-    /// Checks if the buffer has enough data to form a training batch.
-    pub fn is_ready_for_batch(&self, batch_size: usize) -> bool {
-        self.memory.len() >= batch_size
     }
 
     /// Randomly samples a batch of trajectories for Neural Network backpropagation.
@@ -155,23 +150,26 @@ where
                 current_traj.reward += result.reward;
 
                 if result.is_violated {
-                    println!("🚨 [Episode {}] BẮT ĐƯỢC BUG LOGIC! Dừng ngay Hồi này!", episode);
+                    println!(
+                        "🚨 [Episode {}] LOGIC BUG DETECTED! Terminating this episode!",
+                        episode
+                    );
                     current_traj.is_interesting = true;
-                    
-                    // GHI ARTIFACT RA Ổ CỨNG
+
+                    // SAVE ARTIFACT TO DISK
                     use std::fs;
                     use std::io::Write;
-                    let _ = fs::create_dir_all("artifacts"); // Tạo thư mục nếu chưa có
+                    let _ = fs::create_dir_all("artifacts"); // Create directory if it doesn't exist
                     let filename = format!("artifacts/bug_ep_{}.txt", episode);
                     let mut file = fs::File::create(&filename).unwrap();
-                    
-                    // In thẳng cái mảng Action (đã được Translate) ra file
-                    writeln!(file, "Chuỗi hành động làm sập hệ thống:").unwrap();
+
+                    // Write the translated Action array directly to the file
+                    writeln!(file, "Action sequence that crashed the system:").unwrap();
                     for (i, a) in current_traj.actions.iter().enumerate() {
                         writeln!(file, "{}. {:?}", i, a).unwrap();
                     }
-                    println!("💾 Đã cất bằng chứng vào {}", filename);
-                    
+                    println!("💾 Evidence saved to {}", filename);
+
                     break;
                 }
 
@@ -187,32 +185,32 @@ where
                 current_traj.is_interesting = true;
             }
 
-            // IN RA NHẬT KÝ CHI TIẾT (Mỗi 50 Hồi)
+            // PRINT DETAILED LOGS (Every 50 Episodes)
             if episode % 50 == 0 {
-                println!("\n🔍 [DEBUG Episode {}] Hé lộ Tâm hồn AI:", episode);
-                println!("  - Tổng Điểm (Reward): {:.2}", current_traj.reward);
-                println!("  - Độ dài chuỗi (Steps): {}", current_traj.actions.len());
-                println!("  - 3 Hành động cuối cùng AI đã chọn:");
-                
+                println!("\n🔍 [DEBUG Episode {}] AI Mind Revealed:", episode);
+                println!("  - Total Reward: {:.2}", current_traj.reward);
+                println!("  - Sequence Length (Steps): {}", current_traj.actions.len());
+                println!("  - Last 3 actions chosen by AI:");
+
                 // Lấy 3 action cuối (hoặc ít hơn nếu chuỗi ngắn)
                 let tail_len = current_traj.actions.len().min(3);
                 let start_idx = current_traj.actions.len() - tail_len;
-                
+
                 for (i, action) in current_traj.actions[start_idx..].iter().enumerate() {
                     let prob_percent = current_traj.log_probs[start_idx + i].exp() * 100.0;
-                    println!("      + Lệnh: {:?} (Tự tin: {:.2}%)", action, prob_percent);
+                    println!("      + Command: {:?} (Confidence: {:.2}%)", action, prob_percent);
                 }
             }
 
             self.buffer.push_trajectory(current_traj);
 
-            // Trigger Neural Network training if we have gathered enough episodes.
-            if self.buffer.is_ready_for_batch(self.batch_size) {
+            if episode % self.batch_size == 0 {
                 let batch = self.buffer.sample_for_training(self.batch_size);
                 self.agent.learn_from_batch(&batch);
+
                 println!(
-                    "🧠 [Episode {}] Batch training complete. Backpropagation applied!",
-                    episode
+                    "🧠 [Episode {}] Finished learning a batch of {} samples from the replay buffer.",
+                    episode, self.batch_size
                 );
             }
         }
@@ -221,12 +219,12 @@ where
 
 #[cfg(feature = "burn-backend")]
 pub mod burn_helpers {
+    use burn::backend::wgpu::{Wgpu, WgpuDevice};
+    use burn::backend::Autodiff;
     use burn::nn::{Linear, LinearConfig, Relu};
     use burn::optim::{AdamConfig, GradientsParams, Optimizer};
     use burn::prelude::*;
     use burn::tensor::backend::AutodiffBackend;
-    use burn::backend::Autodiff;
-    use burn::backend::wgpu::{Wgpu, WgpuDevice};
     use rand::distr::{weighted::WeightedIndex, Distribution};
     use rand::rng;
 
@@ -301,8 +299,8 @@ pub mod burn_helpers {
     }
 
     // Automatically implement the standard NeuralAgent from the core library.
-    impl<B: AutodiffBackend, T: ActionTranslator, O: Optimizer<MultiHeadNet<B>, B>> super::NeuralAgent
-        for BurnAgent<B, T, O>
+    impl<B: AutodiffBackend, T: ActionTranslator, O: Optimizer<MultiHeadNet<B>, B>>
+        super::NeuralAgent for BurnAgent<B, T, O>
     {
         type State = Vec<f32>; // Input must be a float array
         type Action = T::TargetAction;
@@ -384,8 +382,8 @@ pub mod burn_helpers {
                     let state = &traj.states[i];
                     let action_indices = &traj.action_indices[i];
 
-                    let state_tensor = Tensor::<B, 1>::from_data(state.as_slice(), &self.device)
-                        .unsqueeze::<2>();
+                    let state_tensor =
+                        Tensor::<B, 1>::from_data(state.as_slice(), &self.device).unsqueeze::<2>();
 
                     // Forward pass with Autodiff enabled
                     let head_logits = self.net.forward(state_tensor);
@@ -393,14 +391,13 @@ pub mod burn_helpers {
                     // For each head, calculate the log probability of the action that was actually taken
                     for (h, logits) in head_logits.into_iter().enumerate() {
                         let probs = burn::tensor::activation::softmax(logits, 1);
-                        
+
                         // Select the probability of the index that was chosen during the episode
                         let chosen_index = action_indices[h];
-                        let chosen_index_tensor = Tensor::<B, 1, Int>::from_data(
-                            [chosen_index as i64], 
-                            &self.device
-                        ).unsqueeze::<2>();
-                        
+                        let chosen_index_tensor =
+                            Tensor::<B, 1, Int>::from_data([chosen_index as i64], &self.device)
+                                .unsqueeze::<2>();
+
                         let chosen_prob = probs.gather(1, chosen_index_tensor);
                         let log_prob = chosen_prob.log();
 
@@ -430,7 +427,9 @@ pub mod burn_helpers {
 
             // STEP 4: Update weights using the Optimizer
             let grads = GradientsParams::from_grads(gradients, &self.net);
-            self.net = self.optimizer.step(self.learning_rate, self.net.clone(), grads);
+            self.net = self
+                .optimizer
+                .step(self.learning_rate, self.net.clone(), grads);
 
             println!("✅ Model weights updated! The AI is a bit smarter now.");
         }
@@ -444,11 +443,16 @@ pub mod burn_helpers {
         head_sizes: &[usize],
         learning_rate: f64,
         translator: T,
-    ) -> BurnAgent<DefaultGpuBackend, T, impl Optimizer<MultiHeadNet<DefaultGpuBackend>, DefaultGpuBackend>> {
+    ) -> BurnAgent<
+        DefaultGpuBackend,
+        T,
+        impl Optimizer<MultiHeadNet<DefaultGpuBackend>, DefaultGpuBackend>,
+    > {
         let device = WgpuDevice::DefaultDevice;
 
         // Initialize the Multi-head Neural Network
-        let net = MultiHeadNet::<DefaultGpuBackend>::new(&device, input_size, hidden_size, head_sizes);
+        let net =
+            MultiHeadNet::<DefaultGpuBackend>::new(&device, input_size, hidden_size, head_sizes);
 
         // Initialize the Adam Optimizer
         let optimizer = AdamConfig::new().init();
