@@ -275,15 +275,10 @@ pub mod burn_helpers {
             // 3. Process each Head
             for (i, mut logits) in head_logits.into_iter().enumerate() {
                 // ACTION MASKING TECHNIQUE
-                if i == 0 && mask.len() > 0 {
-                    let mut logits_data = logits.clone().into_data().to_vec::<f32>().unwrap();
-                    for (idx, &is_valid) in mask.iter().enumerate() {
-                        if !is_valid {
-                            logits_data[idx] = -1e9;
-                        }
-                    }
-                    logits = Tensor::<B, 1>::from_data(logits_data.as_slice(), &self.device)
-                        .reshape([1, mask.len()]);
+                if i == 0 && !mask.is_empty() {
+                    let mask_data = TensorData::new(mask.to_vec(), [1, mask.len()]);
+                    let mask_tensor = Tensor::<B, 2, Bool>::from_data(mask_data, &self.device);
+                    logits = logits.mask_fill(mask_tensor.bool_not(), -1e9);
                 }
 
                 // Convert Logits to Probabilities (Softmax)
