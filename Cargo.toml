@@ -1,0 +1,9 @@
+[package]
+name = "semantic_rl_fuzzer"
+version = "0.1.0"
+edition = "2021"
+description = "A semantic, Reinforcement Learning-guided fuzzing framework."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/huynq55-v3/semantic_rl_fuzzer"
+keywords = ["fuzzing", "ai", "reinforcement-learning", "testing"]
+categories = ["development-tools::testing"]
