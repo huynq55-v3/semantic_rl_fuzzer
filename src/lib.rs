@@ -601,10 +601,13 @@ pub mod burn_helpers {
 
             // TOTAL SCORE = ORACLE SCORE + (CURIOSITY * WEIGHT)
             // Detach so Actor cannot manipulate the Forward Net
-            let intrinsic_weight = 0.5;
-            let total_rewards = extrinsic_rewards
-                .clone()
-                .add(intrinsic_rewards.clone().detach().mul_scalar(intrinsic_weight));
+            let intrinsic_weight = 10;
+            let total_rewards = extrinsic_rewards.clone().add(
+                intrinsic_rewards
+                    .clone()
+                    .detach()
+                    .mul_scalar(intrinsic_weight),
+            );
 
             for (h, logits) in all_head_logits.into_iter().enumerate() {
                 let probs = burn::tensor::activation::softmax(logits, 1);
