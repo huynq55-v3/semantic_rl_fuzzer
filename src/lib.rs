@@ -296,15 +296,71 @@ pub mod burn_helpers {
     use burn::optim::{AdamConfig, GradientsParams, Optimizer};
     use burn::prelude::*;
     use burn::tensor::backend::AutodiffBackend;
-    use rand::distr::{weighted::WeightedIndex, Distribution};
+    use rand::distr::{weighted::WeightedIndex, Distribution, Uniform};
     use rand::rng;
 
     pub type DefaultCpuBackend = Autodiff<NdArray>;
 
     // ==========================================
+    // TRÍ NHỚ DÀI HẠN (OFF-POLICY REPLAY BUFFER)
+    // Lưu trữ kinh nghiệm quá khứ để Nhà Tiên Tri không bị "não cá vàng"
+    // ==========================================
+    #[derive(Clone)]
+    pub struct Transition {
+        pub state: Vec<f32>,
+        pub action_one_hot: Vec<f32>,
+        pub next_state: Vec<f32>,
+    }
+
+    pub struct ForwardReplayBuffer {
+        pub capacity: usize,
+        pub memory: Vec<Transition>,
+        pub ptr: usize,
+    }
+
+    impl ForwardReplayBuffer {
+        pub fn new(capacity: usize) -> Self {
+            Self {
+                capacity,
+                memory: Vec::with_capacity(capacity),
+                ptr: 0,
+            }
+        }
+
+        pub fn push(&mut self, state: &[f32], action: &[f32], next_state: &[f32]) {
+            let t = Transition {
+                state: state.to_vec(),
+                action_one_hot: action.to_vec(),
+                next_state: next_state.to_vec(),
+            };
+            if self.memory.len() < self.capacity {
+                self.memory.push(t);
+            } else {
+                self.memory[self.ptr] = t;
+            }
+            self.ptr = (self.ptr + 1) % self.capacity;
+        }
+
+        pub fn sample(&self, batch_size: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+            let mut rng = rng();
+            let mut states = Vec::with_capacity(batch_size * self.memory[0].state.len());
+            let mut actions = Vec::with_capacity(batch_size * self.memory[0].action_one_hot.len());
+            let mut next_states = Vec::with_capacity(batch_size * self.memory[0].next_state.len());
+
+            let dist = Uniform::new(0, self.memory.len()).unwrap();
+            for _ in 0..batch_size {
+                let idx = dist.sample(&mut rng);
+                let t = &self.memory[idx];
+                states.extend_from_slice(&t.state);
+                actions.extend_from_slice(&t.action_one_hot);
+                next_states.extend_from_slice(&t.next_state);
+            }
+            (states, actions, next_states)
+        }
+    }
+
+    // ==========================================
     // DEEPMIND'S NOISY LINEAR LAYER
-    // Injects noise directly into weights for automatic exploration
-    // Paper: "Noisy Networks for Exploration" (Fortunato et al., 2017)
     // ==========================================
     #[derive(Module, Debug)]
     pub struct NoisyLinear<B: Backend> {
@@ -318,8 +374,6 @@ pub mod burn_helpers {
     impl<B: Backend> NoisyLinear<B> {
         pub fn new(device: &B::Device, d_in: usize, d_out: usize) -> Self {
             let bound = (1.0 / d_in as f64).sqrt();
-
-            // mu initialized like a normal linear layer
             let mu_w = Tensor::<B, 2>::random(
                 [d_in, d_out],
                 burn::tensor::Distribution::Uniform(-bound, bound),
@@ -331,7 +385,6 @@ pub mod burn_helpers {
                 device,
             );
 
-            // sigma initialized to a positive constant (baseline tremor)
             let sig_init = 0.5 / (d_in as f32).sqrt();
             let sig_w = Tensor::<B, 2>::zeros([d_in, d_out], device).add_scalar(sig_init);
             let sig_b = Tensor::<B, 1>::zeros([d_out], device).add_scalar(sig_init);
@@ -349,7 +402,6 @@ pub mod burn_helpers {
             let [_, d_in] = x.dims();
             let d_out = self.d_out;
 
-            // Core algorithm: inject fresh Gaussian noise N(0,1) at every step
             let eps_w = Tensor::<B, 2>::random(
                 [d_in, d_out],
                 burn::tensor::Distribution::Normal(0.0, 1.0),
@@ -361,7 +413,6 @@ pub mod burn_helpers {
                 &x.device(),
             );
 
-            // Formula: W = mu + sigma * epsilon
             let weight = self.mu_w.val().add(self.sig_w.val().mul(eps_w));
             let bias = self.mu_b.val().add(self.sig_b.val().mul(eps_b));
 
@@ -370,13 +421,13 @@ pub mod burn_helpers {
     }
 
     // ==========================================
-    // 1. ACTOR NETWORK (Action selection brain)
+    // 1. ACTOR NETWORK
     // ==========================================
     #[derive(Module, Debug)]
     pub struct MultiHeadNet<B: Backend> {
         shared_layer_1: Linear<B>,
         shared_layer_2: Linear<B>,
-        heads: Vec<NoisyLinear<B>>, // DeepMind Noisy Nets for exploration
+        pub heads: Vec<NoisyLinear<B>>,
         relu: Relu,
     }
 
@@ -414,7 +465,7 @@ pub mod burn_helpers {
     }
 
     // ==========================================
-    // 2. FORWARD NETWORK (Predictor - Curiosity)
+    // 2. FORWARD NETWORK
     // ==========================================
     #[derive(Module, Debug)]
     pub struct ForwardNet<B: Backend> {
@@ -431,7 +482,6 @@ pub mod burn_helpers {
             num_heads: usize,
             hidden_dim: usize,
         ) -> Self {
-            // Input = State + Action, Output = predicted Next State
             let input_dim = state_dim + num_heads;
             Self {
                 fc_1: LinearConfig::new(input_dim, hidden_dim).init(device),
@@ -447,17 +497,8 @@ pub mod burn_helpers {
             let x = self.relu.forward(x);
             let x = self.fc_2.forward(x);
             let x = self.relu.forward(x);
-            self.out.forward(x) // Returns predicted S(t+1)
+            self.out.forward(x)
         }
-    }
-
-    // ==========================================
-    // 3. COMBINED MODEL (ICM NET)
-    // ==========================================
-    #[derive(Module, Debug)]
-    pub struct ICMNet<B: Backend> {
-        pub actor: MultiHeadNet<B>,
-        pub forward_net: ForwardNet<B>,
     }
 
     pub trait ActionTranslator: Send + Sync + Clone {
@@ -465,20 +506,27 @@ pub mod burn_helpers {
         fn translate(&self, head_outputs: &[usize]) -> Self::TargetAction;
     }
 
-    pub struct BurnAgent<B: AutodiffBackend, T: ActionTranslator, O: Optimizer<ICMNet<B>, B>> {
-        pub net: ICMNet<B>, // OWNS BOTH NETWORKS
+    // ==========================================
+    // BỘ NÃO TÁCH RỜI (DUAL OPTIMIZERS)
+    // ==========================================
+    pub struct BurnAgent<B: AutodiffBackend, T: ActionTranslator, ActorO, FwdO>
+    where
+        ActorO: Optimizer<MultiHeadNet<B>, B>,
+        FwdO: Optimizer<ForwardNet<B>, B>,
+    {
+        pub actor_net: MultiHeadNet<B>,
+        pub forward_net: ForwardNet<B>,
+        pub actor_opt: ActorO,
+        pub fwd_opt: FwdO,
         pub translator: T,
-        pub optimizer: O,
         pub learning_rate: f64,
         pub device: B::Device,
+        pub replay_buffer: ForwardReplayBuffer, // Trí nhớ 100,000 steps
     }
 
-    // ==========================================
-    // BURN ACTOR (Runs on Rayon - Only extracts Actor)
-    // ==========================================
     #[derive(Clone)]
     pub struct BurnActor<B: Backend, T: ActionTranslator> {
-        pub actor_net: MultiHeadNet<B>, // NO FORWARD NET FOR SPEED OPTIMIZATION
+        pub actor_net: MultiHeadNet<B>,
         pub translator: T,
         pub device: B::Device,
     }
@@ -498,34 +546,12 @@ pub mod burn_helpers {
             );
             let head_logits = self.actor_net.forward(state_tensor);
 
-            // CONTRACT: Environment MUST provide exactly one mask per head.
-            // Empty vec![] means "no mask for this head" (explicit opt-out).
-            assert_eq!(
-                masks.len(),
-                head_logits.len(),
-                "FATAL: Environment contract violation! \
-                 Neural network has {} heads but get_action_mask() returned {} masks.",
-                head_logits.len(),
-                masks.len(),
-            );
-
             let mut selected_indices = Vec::new();
             let mut total_log_prob = 0.0;
 
             for (i, mut logits) in head_logits.into_iter().enumerate() {
                 let head_size = logits.dims()[1];
-
                 if !masks[i].is_empty() {
-                    // CONTRACT: If a mask is provided, its length MUST match the head size.
-                    assert_eq!(
-                        masks[i].len(),
-                        head_size,
-                        "FATAL: Mask size mismatch at head {}! Expected {} but got {}.",
-                        i,
-                        head_size,
-                        masks[i].len(),
-                    );
-
                     let mask_tensor = Tensor::<B, 2, Bool>::from_data(
                         TensorData::new(masks[i].clone(), [1, head_size]),
                         &self.device,
@@ -552,11 +578,11 @@ pub mod burn_helpers {
         }
     }
 
-    // ==========================================
-    // LEARNING PHASE WITH CURIOSITY (ICM)
-    // ==========================================
-    impl<B: AutodiffBackend, T: ActionTranslator, O: Optimizer<ICMNet<B>, B>> super::NeuralAgent
-        for BurnAgent<B, T, O>
+    impl<B: AutodiffBackend, T: ActionTranslator, ActorO, FwdO> super::NeuralAgent
+        for BurnAgent<B, T, ActorO, FwdO>
+    where
+        ActorO: Optimizer<MultiHeadNet<B>, B>,
+        FwdO: Optimizer<ForwardNet<B>, B>,
     {
         type State = Vec<f32>;
         type Action = T::TargetAction;
@@ -564,7 +590,7 @@ pub mod burn_helpers {
 
         fn get_actor(&self) -> Self::Actor {
             BurnActor {
-                actor_net: self.net.actor.valid(), // Perfectly decoupled!
+                actor_net: self.actor_net.valid(),
                 translator: self.translator.clone(),
                 device: self.device.clone(),
             }
@@ -574,158 +600,188 @@ pub mod burn_helpers {
             &mut self,
             trajectories: &[super::Trajectory<Self::State, Self::Action>],
         ) {
+            let head_sizes: Vec<usize> = self.actor_net.heads.iter().map(|h| h.d_out).collect();
+            let total_action_dims: usize = head_sizes.iter().sum();
+
             let mut all_s = Vec::new();
             let mut all_sn = Vec::new();
             let mut all_ai_i64 = Vec::new();
             let mut all_ai_f32 = Vec::new();
             let mut all_rewards = Vec::new();
 
-            let num_heads = trajectories[0].action_indices[0].len();
-
-            // Derive head_sizes from the network weights for One-Hot encoding
-            let head_sizes: Vec<usize> = self
-                .net
-                .actor
-                .heads
-                .iter()
-                .map(|h| h.d_out)
-                .collect();
-            let total_action_dims: usize = head_sizes.iter().sum();
-
-            // 1. EXTRACT DATA (Fixes: index mismatch, silent filter, one-hot encoding)
-            // - Iterate by action_indices.len(), NOT states.len() (run_fuzzing pushes 2 states per step)
-            // - Removed reward != 0.0 filter (was dropping all Hold trajectories)
+            // 1. GOM DỮ LIỆU & BƠM VÀO KHO TRÍ NHỚ
             for t in trajectories.iter().filter(|t| !t.action_indices.is_empty()) {
                 for i in 0..t.action_indices.len() {
-                    // S_t is at [2*i], S_{t+1} is at [2*i + 1]
-                    all_s.extend_from_slice(&t.states[2 * i]);
-                    all_sn.extend_from_slice(&t.states[2 * i + 1]);
+                    let s_t = &t.states[2 * i];
+                    let s_n = &t.states[2 * i + 1];
 
-                    let act_i64 = t.action_indices[i]
-                        .iter()
-                        .map(|&idx| idx as i64)
-                        .collect::<Vec<_>>();
-                    all_ai_i64.extend(act_i64);
+                    all_s.extend_from_slice(s_t);
+                    all_sn.extend_from_slice(s_n);
+                    all_ai_i64.extend(t.action_indices[i].iter().map(|&idx| idx as i64));
 
-                    // One-Hot encode actions (categorical, not ordinal)
                     let mut one_hot = vec![0.0f32; total_action_dims];
                     let mut offset = 0;
                     for (h, &val) in t.action_indices[i].iter().enumerate() {
-                        let size = head_sizes[h];
-                        if val < size {
+                        if val < head_sizes[h] {
                             one_hot[offset + val] = 1.0;
                         }
-                        offset += size;
+                        offset += head_sizes[h];
                     }
-                    all_ai_f32.extend(one_hot);
-
+                    all_ai_f32.extend(one_hot.clone());
                     all_rewards.push(t.reward);
+
+                    // Đẩy dữ liệu vào kho lưu trữ Dài hạn
+                    self.replay_buffer.push(s_t, &one_hot, s_n);
                 }
             }
 
             if all_s.is_empty() {
                 return;
             }
-
             let total_steps = all_rewards.len();
             let state_dim = trajectories[0].states[0].len();
 
-            // 2. CONVERT TO TENSORS
-            let states_tensor = Tensor::<B, 2>::from_data(
-                TensorData::new(all_s, [total_steps, state_dim]),
-                &self.device,
-            );
-            let next_states_tensor = Tensor::<B, 2>::from_data(
-                TensorData::new(all_sn, [total_steps, state_dim]),
-                &self.device,
-            );
-            let actions_f32_tensor = Tensor::<B, 2>::from_data(
-                TensorData::new(all_ai_f32, [total_steps, total_action_dims]),
-                &self.device,
-            );
-            let extrinsic_rewards = Tensor::<B, 1>::from_data(
-                TensorData::new(all_rewards, [total_steps]),
-                &self.device,
-            );
+            // ==========================================
+            // PHASE 1: TRAIN FORWARD NET (OFF-POLICY MINI-BATCH)
+            // Ép Tiên Tri ôn lại bài cũ 10 lần (Epochs) để không bao giờ quên
+            // ==========================================
+            let fwd_epochs = 5;
+            let fwd_batch_size = 1024.min(self.replay_buffer.memory.len());
+            let mut avg_fwd_loss = 0.0;
 
-            // 3. FORWARD NET PREDICTS & COMPUTE CURIOSITY
-            let pred_next_states = self
-                .net
-                .forward_net
-                .forward(states_tensor.clone(), actions_f32_tensor);
+            if self.replay_buffer.memory.len() >= fwd_batch_size {
+                for _ in 0..fwd_epochs {
+                    let (b_s, b_a, b_sn) = self.replay_buffer.sample(fwd_batch_size);
 
-            // MSE = || S_pred - S_next ||^2
-            let mse = (pred_next_states - next_states_tensor).powf_scalar(2.0);
+                    let s_tens = Tensor::<B, 2>::from_data(
+                        TensorData::new(b_s, [fwd_batch_size, state_dim]),
+                        &self.device,
+                    );
+                    let a_tens = Tensor::<B, 2>::from_data(
+                        TensorData::new(b_a, [fwd_batch_size, total_action_dims]),
+                        &self.device,
+                    );
+                    let sn_tens = Tensor::<B, 2>::from_data(
+                        TensorData::new(b_sn, [fwd_batch_size, state_dim]),
+                        &self.device,
+                    );
 
-            // Intrinsic Reward: Higher error = more curiosity!
-            let intrinsic_rewards = mse.clone().mean_dim(1).reshape([total_steps]);
-            let forward_loss = mse.mean();
+                    let pred_sn = self.forward_net.forward(s_tens, a_tens);
+                    let fwd_loss = (pred_sn - sn_tens).powf_scalar(2.0).mean();
 
-            // 4. ACTOR DECIDES & COMBINE SCORES
-            let all_head_logits = self.net.actor.forward(states_tensor);
-            let mut total_actor_loss = Tensor::<B, 1>::from_data([0.0], &self.device);
+                    avg_fwd_loss += fwd_loss.clone().into_data().to_vec::<f32>().unwrap()[0];
 
-            // TOTAL SCORE = ORACLE SCORE + (CURIOSITY * WEIGHT)
-            // Detach so Actor cannot manipulate the Forward Net
-            let intrinsic_weight = 10;
-            let total_rewards = extrinsic_rewards.clone().add(
-                intrinsic_rewards
-                    .clone()
-                    .detach()
-                    .mul_scalar(intrinsic_weight),
-            );
+                    let fwd_grads = fwd_loss.backward();
+                    let fwd_grads_params =
+                        GradientsParams::from_grads(fwd_grads, &self.forward_net);
+                    // Dùng Optimizer riêng cho Tiên Tri
+                    self.forward_net = self.fwd_opt.step(
+                        self.learning_rate,
+                        self.forward_net.clone(),
+                        fwd_grads_params,
+                    );
+                }
+                avg_fwd_loss /= fwd_epochs as f32;
+            }
 
-            for (h, logits) in all_head_logits.into_iter().enumerate() {
-                let probs = burn::tensor::activation::softmax(logits, 1);
-                let current_head_indices: Vec<i64> = all_ai_i64
-                    .iter()
-                    .skip(h)
-                    .step_by(num_heads)
-                    .copied()
-                    .collect();
-                let index_tensor = Tensor::<B, 2, Int>::from_data(
-                    TensorData::new(current_head_indices, [total_steps, 1]),
+            // ==========================================
+            // PHASE 2: TRAIN ACTOR (ON-POLICY MINI-BATCH)
+            // Băm nhỏ 51,200 steps ra thành từng mẻ 1024 để tiêu hóa
+            // ==========================================
+            let actor_batch_size = 1024;
+            let num_batches = (total_steps + actor_batch_size - 1) / actor_batch_size;
+            let mut avg_actor_loss = 0.0;
+            let mut avg_curiosity = 0.0;
+
+            for b in 0..num_batches {
+                let start = b * actor_batch_size;
+                let end = (start + actor_batch_size).min(total_steps);
+                let current_batch_size = end - start;
+
+                let mb_s = all_s[start * state_dim..end * state_dim].to_vec();
+                let mb_sn = all_sn[start * state_dim..end * state_dim].to_vec();
+                let mb_a_f32 =
+                    all_ai_f32[start * total_action_dims..end * total_action_dims].to_vec();
+                let mb_rew = all_rewards[start..end].to_vec();
+
+                let s_tens = Tensor::<B, 2>::from_data(
+                    TensorData::new(mb_s, [current_batch_size, state_dim]),
+                    &self.device,
+                );
+                let sn_tens = Tensor::<B, 2>::from_data(
+                    TensorData::new(mb_sn, [current_batch_size, state_dim]),
+                    &self.device,
+                );
+                let a_tens = Tensor::<B, 2>::from_data(
+                    TensorData::new(mb_a_f32, [current_batch_size, total_action_dims]),
+                    &self.device,
+                );
+                let ext_rew_tens = Tensor::<B, 1>::from_data(
+                    TensorData::new(mb_rew, [current_batch_size]),
                     &self.device,
                 );
 
-                let safe_probs = probs.gather(1, index_tensor).clamp_min(1e-8);
-                let log_probs = safe_probs.log().reshape([total_steps]);
+                // Dùng ForwardNet VỪA ĐƯỢC CẬP NHẬT để tính điểm tò mò (Không Backprop cho FwdNet ở đây)
+                let pred_sn = self.forward_net.forward(s_tens.clone(), a_tens);
+                let mse = (pred_sn - sn_tens).powf_scalar(2.0);
 
-                let head_loss = log_probs.mul(total_rewards.clone()).neg().mean();
-                total_actor_loss = total_actor_loss.add(head_loss);
+                // Detach để gradient không lan sang Forward Net
+                let int_rewards = mse.mean_dim(1).reshape([current_batch_size]).detach();
+                avg_curiosity += int_rewards
+                    .clone()
+                    .mean()
+                    .into_data()
+                    .to_vec::<f32>()
+                    .unwrap()[0];
+
+                let intrinsic_weight = 10;
+                let total_rewards = ext_rew_tens.add(int_rewards.mul_scalar(intrinsic_weight));
+
+                let all_head_logits = self.actor_net.forward(s_tens);
+                let mut actor_loss_sum = Tensor::<B, 1>::from_data([0.0], &self.device);
+
+                let num_heads = head_sizes.len();
+                for (h, logits) in all_head_logits.into_iter().enumerate() {
+                    let probs = burn::tensor::activation::softmax(logits, 1);
+
+                    // Lấy index hành động tương ứng cho Head này trong mini-batch
+                    let mb_a_i64: Vec<i64> = all_ai_i64[start * num_heads..end * num_heads]
+                        .iter()
+                        .skip(h)
+                        .step_by(num_heads)
+                        .copied()
+                        .collect();
+
+                    let index_tensor = Tensor::<B, 2, Int>::from_data(
+                        TensorData::new(mb_a_i64, [current_batch_size, 1]),
+                        &self.device,
+                    );
+
+                    let safe_probs = probs.gather(1, index_tensor).clamp_min(1e-8);
+                    let log_probs = safe_probs.log().reshape([current_batch_size]);
+
+                    let head_loss = log_probs.mul(total_rewards.clone()).neg().mean();
+                    actor_loss_sum = actor_loss_sum.add(head_loss);
+                }
+
+                avg_actor_loss += actor_loss_sum.clone().into_data().to_vec::<f32>().unwrap()[0];
+
+                // Cập nhật ĐỘC LẬP cho Actor Net
+                let actor_grads = actor_loss_sum.backward();
+                let actor_grads_params = GradientsParams::from_grads(actor_grads, &self.actor_net);
+                self.actor_net = self.actor_opt.step(
+                    self.learning_rate,
+                    self.actor_net.clone(),
+                    actor_grads_params,
+                );
             }
 
-            // 5. UPDATE BOTH NETWORKS SIMULTANEOUSLY
-            let total_loss = total_actor_loss.clone().add(forward_loss.clone());
-            let gradients = total_loss.backward();
-            let grads = GradientsParams::from_grads(gradients, &self.net);
-            self.net = self
-                .optimizer
-                .step(self.learning_rate, self.net.clone(), grads);
-
-            // Extract scalar values from tensors for logging
-            let mean_ext = extrinsic_rewards
-                .mean()
-                .into_data()
-                .to_vec::<f32>()
-                .expect("Failed to read Tensor")[0];
-            let mean_int = intrinsic_rewards
-                .mean()
-                .into_data()
-                .to_vec::<f32>()
-                .expect("Failed to read Tensor")[0];
-            let fwd_loss_val = forward_loss
-                .into_data()
-                .to_vec::<f32>()
-                .expect("Failed to read Tensor")[0];
-            let act_loss_val = total_actor_loss
-                .into_data()
-                .to_vec::<f32>()
-                .expect("Failed to read Tensor")[0];
+            avg_actor_loss /= num_batches as f32;
+            avg_curiosity /= num_batches as f32;
 
             println!(
-                "🔥 ICM Batch ({} steps) | Oracle Score: {:.4} | Curiosity Score: {:.4} | Actor Loss: {:.4} | Forward Loss: {:.4}",
-                total_steps, mean_ext, mean_int, act_loss_val, fwd_loss_val
+                "🔥 Batch ({} steps) | Replay Mem: {}/{} | Int_μ: {:.4} | Act_Loss: {:.4} | Fwd_Loss: {:.4}",
+                total_steps, self.replay_buffer.memory.len(), self.replay_buffer.capacity, avg_curiosity, avg_actor_loss, avg_fwd_loss
             );
         }
     }
@@ -736,11 +792,15 @@ pub mod burn_helpers {
         head_sizes: &[usize],
         learning_rate: f64,
         translator: T,
-    ) -> BurnAgent<DefaultCpuBackend, T, impl Optimizer<ICMNet<DefaultCpuBackend>, DefaultCpuBackend>>
-    {
+    ) -> BurnAgent<
+        DefaultCpuBackend,
+        T,
+        impl Optimizer<MultiHeadNet<DefaultCpuBackend>, DefaultCpuBackend>,
+        impl Optimizer<ForwardNet<DefaultCpuBackend>, DefaultCpuBackend>,
+    > {
         let device = Default::default();
 
-        let actor =
+        let actor_net =
             MultiHeadNet::<DefaultCpuBackend>::new(&device, input_size, hidden_size, head_sizes);
         let total_action_dims: usize = head_sizes.iter().sum();
         let forward_net = ForwardNet::<DefaultCpuBackend>::new(
@@ -750,15 +810,20 @@ pub mod burn_helpers {
             hidden_size,
         );
 
-        let net = ICMNet { actor, forward_net };
-        let optimizer = AdamConfig::new().init();
+        // Khởi tạo 2 Optimizer riêng biệt
+        let actor_opt = AdamConfig::new().init();
+        let fwd_opt = AdamConfig::new().init();
 
         BurnAgent {
-            net,
+            actor_net,
+            forward_net,
+            actor_opt,
+            fwd_opt,
             translator,
-            optimizer,
             learning_rate,
             device,
+            // Sổ tay 100,000 steps cho Nhà Tiên Tri
+            replay_buffer: ForwardReplayBuffer::new(100_000),
         }
     }
 }
