@@ -633,9 +633,29 @@ pub mod burn_helpers {
                 .optimizer
                 .step(self.learning_rate, self.net.clone(), grads);
 
+            // BÓC TÁCH TENSOR RA SỐ THỰC ĐỂ IN LOG THEO DÕI:
+            let mean_ext = extrinsic_rewards
+                .mean()
+                .into_data()
+                .to_vec::<f32>()
+                .expect("Lỗi đọc Tensor")[0];
+            let mean_int = intrinsic_rewards
+                .mean()
+                .into_data()
+                .to_vec::<f32>()
+                .expect("Lỗi đọc Tensor")[0];
+            let fwd_loss_val = forward_loss
+                .into_data()
+                .to_vec::<f32>()
+                .expect("Lỗi đọc Tensor")[0];
+            let act_loss_val = total_actor_loss
+                .into_data()
+                .to_vec::<f32>()
+                .expect("Lỗi đọc Tensor")[0];
+
             println!(
-                "🔥 ICM Batch Trained ({} steps) | Intrinsic Reward Active!",
-                total_steps
+                "🔥 ICM Batch ({} steps) | Điểm Thẩm Phán: {:.4} | Điểm Tò Mò: {:.4} | Actor Loss: {:.4} | Tiên Tri Loss: {:.4}",
+                total_steps, mean_ext, mean_int, act_loss_val, fwd_loss_val
             );
         }
     }
