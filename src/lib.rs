@@ -291,6 +291,7 @@ pub mod burn_helpers {
     use burn::backend::ndarray::NdArray;
     use burn::backend::Autodiff;
     use burn::module::AutodiffModule;
+    use burn::module::Param;
     use burn::nn::{Linear, LinearConfig, Relu};
     use burn::optim::{AdamConfig, GradientsParams, Optimizer};
     use burn::prelude::*;
@@ -301,13 +302,81 @@ pub mod burn_helpers {
     pub type DefaultCpuBackend = Autodiff<NdArray>;
 
     // ==========================================
+    // DEEPMIND'S NOISY LINEAR LAYER
+    // Injects noise directly into weights for automatic exploration
+    // Paper: "Noisy Networks for Exploration" (Fortunato et al., 2017)
+    // ==========================================
+    #[derive(Module, Debug)]
+    pub struct NoisyLinear<B: Backend> {
+        pub mu_w: Param<Tensor<B, 2>>,
+        pub sig_w: Param<Tensor<B, 2>>,
+        pub mu_b: Param<Tensor<B, 1>>,
+        pub sig_b: Param<Tensor<B, 1>>,
+        pub d_out: usize,
+    }
+
+    impl<B: Backend> NoisyLinear<B> {
+        pub fn new(device: &B::Device, d_in: usize, d_out: usize) -> Self {
+            let bound = (1.0 / d_in as f64).sqrt() as f32;
+
+            // mu initialized like a normal linear layer
+            let mu_w = Tensor::<B, 2>::random(
+                [d_in, d_out],
+                burn::tensor::Distribution::Uniform(-bound.into(), bound.into()),
+                device,
+            );
+            let mu_b = Tensor::<B, 1>::random(
+                [d_out],
+                burn::tensor::Distribution::Uniform(-bound.into(), bound.into()),
+                device,
+            );
+
+            // sigma initialized to a positive constant (baseline tremor)
+            let sig_init = 0.5 / (d_in as f32).sqrt();
+            let sig_w = Tensor::<B, 2>::zeros([d_in, d_out], device).add_scalar(sig_init);
+            let sig_b = Tensor::<B, 1>::zeros([d_out], device).add_scalar(sig_init);
+
+            Self {
+                mu_w: Param::from_tensor(mu_w),
+                sig_w: Param::from_tensor(sig_w),
+                mu_b: Param::from_tensor(mu_b),
+                sig_b: Param::from_tensor(sig_b),
+                d_out,
+            }
+        }
+
+        pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+            let [_, d_in] = x.dims();
+            let d_out = self.d_out;
+
+            // Core algorithm: inject fresh Gaussian noise N(0,1) at every step
+            let eps_w = Tensor::<B, 2>::random(
+                [d_in, d_out],
+                burn::tensor::Distribution::Normal(0.0, 1.0),
+                &x.device(),
+            );
+            let eps_b = Tensor::<B, 1>::random(
+                [d_out],
+                burn::tensor::Distribution::Normal(0.0, 1.0),
+                &x.device(),
+            );
+
+            // Formula: W = mu + sigma * epsilon
+            let weight = self.mu_w.val().add(self.sig_w.val().mul(eps_w));
+            let bias = self.mu_b.val().add(self.sig_b.val().mul(eps_b));
+
+            x.matmul(weight).add(bias.unsqueeze_dim(0))
+        }
+    }
+
+    // ==========================================
     // 1. ACTOR NETWORK (Action selection brain)
     // ==========================================
     #[derive(Module, Debug)]
     pub struct MultiHeadNet<B: Backend> {
         shared_layer_1: Linear<B>,
         shared_layer_2: Linear<B>,
-        heads: Vec<Linear<B>>,
+        heads: Vec<NoisyLinear<B>>, // DeepMind Noisy Nets for exploration
         relu: Relu,
     }
 
@@ -322,7 +391,7 @@ pub mod burn_helpers {
             let shared_layer_2 = LinearConfig::new(hidden_size, hidden_size).init(device);
             let mut heads = Vec::new();
             for &size in head_sizes {
-                heads.push(LinearConfig::new(hidden_size, size).init(device));
+                heads.push(NoisyLinear::new(device, hidden_size, size));
             }
             Self {
                 shared_layer_1,
@@ -519,10 +588,7 @@ pub mod burn_helpers {
                 .actor
                 .heads
                 .iter()
-                .map(|h| {
-                    let dims = h.weight.dims();
-                    dims[dims.len() - 1]
-                })
+                .map(|h| h.d_out)
                 .collect();
             let total_action_dims: usize = head_sizes.iter().sum();
 
@@ -637,28 +703,28 @@ pub mod burn_helpers {
                 .optimizer
                 .step(self.learning_rate, self.net.clone(), grads);
 
-            // BÓC TÁCH TENSOR RA SỐ THỰC ĐỂ IN LOG THEO DÕI:
+            // Extract scalar values from tensors for logging
             let mean_ext = extrinsic_rewards
                 .mean()
                 .into_data()
                 .to_vec::<f32>()
-                .expect("Lỗi đọc Tensor")[0];
+                .expect("Failed to read Tensor")[0];
             let mean_int = intrinsic_rewards
                 .mean()
                 .into_data()
                 .to_vec::<f32>()
-                .expect("Lỗi đọc Tensor")[0];
+                .expect("Failed to read Tensor")[0];
             let fwd_loss_val = forward_loss
                 .into_data()
                 .to_vec::<f32>()
-                .expect("Lỗi đọc Tensor")[0];
+                .expect("Failed to read Tensor")[0];
             let act_loss_val = total_actor_loss
                 .into_data()
                 .to_vec::<f32>()
-                .expect("Lỗi đọc Tensor")[0];
+                .expect("Failed to read Tensor")[0];
 
             println!(
-                "🔥 ICM Batch ({} steps) | Điểm Thẩm Phán: {:.4} | Điểm Tò Mò: {:.4} | Actor Loss: {:.4} | Tiên Tri Loss: {:.4}",
+                "🔥 ICM Batch ({} steps) | Oracle Score: {:.4} | Curiosity Score: {:.4} | Actor Loss: {:.4} | Forward Loss: {:.4}",
                 total_steps, mean_ext, mean_int, act_loss_val, fwd_loss_val
             );
         }
