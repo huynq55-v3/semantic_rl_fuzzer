@@ -89,11 +89,23 @@ pub trait TruthOracle<E: FuzzEnvironment>: Send + Sync {
     fn judge(&self, env: &mut E, is_invalid: bool) -> OracleStatus;
 }
 
-pub trait NeuralAgent: Send + Sync {
+/// Lightweight, thread-safe actor for inference across Rayon threads.
+/// Stripped of Autodiff overhead — only pure forward computation.
+pub trait FuzzActor: Send + Clone {
     type State;
     type Action;
-
     fn choose_action(&self, state: &Self::State, mask: &[bool]) -> (Self::Action, Vec<usize>, f32);
+}
+
+/// The learner side: owns the Autodiff graph, produces lightweight Actors.
+/// Only requires `Send` (not `Sync`) since it is never shared across threads.
+pub trait NeuralAgent: Send {
+    type State;
+    type Action;
+    type Actor: FuzzActor<State = Self::State, Action = Self::Action>;
+
+    /// Extract a thread-safe actor (no Autodiff) for parallel inference.
+    fn get_actor(&self) -> Self::Actor;
     fn learn_from_batch(&mut self, trajectories: &[Trajectory<Self::State, Self::Action>]);
 }
 
@@ -138,28 +150,38 @@ where
             let start_time = Instant::now();
 
             // ==========================================
-            // THU THẬP DỮ LIỆU ĐA LUỒNG (RAYON)
+            // EXTRACT ACTOR (thread-safe, no Autodiff)
+            // Pre-clone on main thread to avoid Sync requirement
             // ==========================================
-            let mut rollouts: Vec<Trajectory<E::State, E::Action>> = (0..self.config.num_envs)
+            let actor_template = self.agent.get_actor();
+            let oracle_ref = &self.oracle;
+            let max_steps = self.config.max_steps_per_episode;
+
+            // Pre-clone actors + envs on the main thread (single-threaded, no Sync needed)
+            let work_items: Vec<_> = (0..self.config.num_envs)
+                .map(|_| (actor_template.clone(), self.base_env.clone()))
+                .collect();
+
+            let mut rollouts: Vec<Trajectory<E::State, E::Action>> = work_items
                 .into_par_iter()
-                .map(|_| {
-                    let mut local_env = self.base_env.clone();
+                .map(|(actor, mut local_env)| {
                     local_env.reset();
 
                     let mut traj = Trajectory {
-                        states: Vec::with_capacity(self.config.max_steps_per_episode),
-                        actions: Vec::with_capacity(self.config.max_steps_per_episode),
-                        action_indices: Vec::with_capacity(self.config.max_steps_per_episode),
-                        log_probs: Vec::with_capacity(self.config.max_steps_per_episode),
+                        states: Vec::with_capacity(max_steps),
+                        actions: Vec::with_capacity(max_steps),
+                        action_indices: Vec::with_capacity(max_steps),
+                        log_probs: Vec::with_capacity(max_steps),
                         reward: 0.0,
                         is_interesting: false,
                     };
 
-                    for _ in 0..self.config.max_steps_per_episode {
+                    for _ in 0..max_steps {
                         let state = local_env.get_state();
                         let mask = local_env.get_action_mask();
 
-                        let (action, indices, log_prob) = self.agent.choose_action(&state, &mask);
+                        // Use ACTOR (owned, not shared) for thread-safe inference
+                        let (action, indices, log_prob) = actor.choose_action(&state, &mask);
                         let result = local_env.step(&action);
 
                         traj.states.push(state.clone());
@@ -167,7 +189,7 @@ where
                         traj.action_indices.push(indices);
                         traj.log_probs.push(log_prob);
 
-                        let status = self.oracle.judge(&mut local_env, result.is_invalid);
+                        let status = oracle_ref.judge(&mut local_env, result.is_invalid);
 
                         match status {
                             OracleStatus::Violated => {
@@ -256,6 +278,7 @@ pub mod burn_helpers {
     // 1. Đổi sang NdArray cho CPU optimization
     use burn::backend::ndarray::NdArray;
     use burn::backend::Autodiff;
+    use burn::module::AutodiffModule;
     use burn::nn::{Linear, LinearConfig, Relu};
     use burn::optim::{AdamConfig, GradientsParams, Optimizer};
     use burn::prelude::*;
@@ -311,8 +334,8 @@ pub mod burn_helpers {
         }
     }
 
-    pub trait ActionTranslator {
-        type TargetAction;
+    pub trait ActionTranslator: Send + Sync + Clone {
+        type TargetAction: Send + Sync + Clone + std::fmt::Debug;
         fn translate(&self, head_outputs: &[usize]) -> Self::TargetAction;
     }
 
@@ -324,9 +347,17 @@ pub mod burn_helpers {
         pub device: B::Device,
     }
 
-    impl<B: AutodiffBackend, T: ActionTranslator, O: Optimizer<MultiHeadNet<B>, B>>
-        super::NeuralAgent for BurnAgent<B, T, O>
-    {
+    // ==========================================
+    // BURN ACTOR: Thread-safe inference (no Autodiff)
+    // ==========================================
+    #[derive(Clone)]
+    pub struct BurnActor<B: Backend, T: ActionTranslator> {
+        pub net: MultiHeadNet<B>,
+        pub translator: T,
+        pub device: B::Device,
+    }
+
+    impl<B: Backend, T: ActionTranslator> super::FuzzActor for BurnActor<B, T> {
         type State = Vec<f32>;
         type Action = T::TargetAction;
 
@@ -368,6 +399,25 @@ pub mod burn_helpers {
 
             let final_action = self.translator.translate(&selected_indices);
             (final_action, selected_indices, total_log_prob)
+        }
+    }
+
+    // ==========================================
+    // BURN AGENT: Learner side (owns Autodiff graph)
+    // ==========================================
+    impl<B: AutodiffBackend, T: ActionTranslator, O: Optimizer<MultiHeadNet<B>, B>>
+        super::NeuralAgent for BurnAgent<B, T, O>
+    {
+        type State = Vec<f32>;
+        type Action = T::TargetAction;
+        type Actor = BurnActor<B::InnerBackend, T>;
+
+        fn get_actor(&self) -> Self::Actor {
+            BurnActor {
+                net: self.net.valid(), // .valid() strips Autodiff → plain Backend
+                translator: self.translator.clone(),
+                device: self.device.clone(),
+            }
         }
 
         fn learn_from_batch(
@@ -455,7 +505,7 @@ pub mod burn_helpers {
                 .step(self.learning_rate, self.net.clone(), grads);
 
             println!(
-                "🔥 Huấn luyện xong batch {} steps. CPU đã hoạt động hết công suất.",
+                "🔥 Trained batch of {} steps. CPU running at full capacity.",
                 total_steps
             );
         }
