@@ -134,7 +134,10 @@ where
     A: NeuralAgent<State = E::State, Action = E::Action>,
     O: TruthOracle<E>,
 {
-    pub fn run_fuzzing(&mut self) {
+    pub fn run_fuzzing<L>(&mut self, mut on_log: L)
+    where
+        L: FnMut(usize, &[Trajectory<E::State, E::Action>]),
+    {
         let (artifact_tx, artifact_rx) = mpsc::channel::<(String, String)>();
 
         let writer_thread = std::thread::spawn(move || {
@@ -249,11 +252,8 @@ where
                 }
             }
 
-            self.agent.learn_from_batch(&rollouts);
-            rollouts.clear();
-
             // ==========================================
-            // LOGGING THEO CONFIG
+            // LOGGING & CALLBACK
             // ==========================================
             if iteration % self.config.log_interval == 0 {
                 let avg_reward = total_batch_reward / self.config.num_envs as f32;
@@ -265,7 +265,13 @@ where
                     "📊 [Iter {} | Ep {}] Avg Reward: {:.2} | Crashes: {} | Speed: {:.0} steps/s",
                     iteration, global_episodes, avg_reward, crashes_found, fps
                 );
+
+                // Fire callback so consuming code can analyze the batch
+                on_log(iteration, &rollouts);
             }
+
+            self.agent.learn_from_batch(&rollouts);
+            rollouts.clear();
         }
 
         drop(artifact_tx);
