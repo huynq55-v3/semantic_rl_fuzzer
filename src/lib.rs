@@ -80,7 +80,7 @@ pub trait FuzzEnvironment: Clone + Send + Sync {
     type Action: Send + Sync;
 
     fn get_state(&self) -> Self::State;
-    fn get_action_mask(&self) -> Vec<bool>;
+    fn get_action_mask(&self) -> Vec<Vec<bool>>;
     fn step(&mut self, action: &Self::Action) -> StepResult<Self::State>;
     fn reset(&mut self);
 }
@@ -94,7 +94,7 @@ pub trait TruthOracle<E: FuzzEnvironment>: Send + Sync {
 pub trait FuzzActor: Send + Clone {
     type State;
     type Action;
-    fn choose_action(&self, state: &Self::State, mask: &[bool]) -> (Self::Action, Vec<usize>, f32);
+    fn choose_action(&self, state: &Self::State, masks: &[Vec<bool>]) -> (Self::Action, Vec<usize>, f32);
 }
 
 /// The learner side: owns the Autodiff graph, produces lightweight Actors.
@@ -181,10 +181,10 @@ where
 
                     for _ in 0..max_steps {
                         let state = local_env.get_state();
-                        let mask = local_env.get_action_mask();
+                        let masks = local_env.get_action_mask();
 
                         // Use ACTOR (owned, not shared) for thread-safe inference
-                        let (action, indices, log_prob) = actor.choose_action(&state, &mask);
+                        let (action, indices, log_prob) = actor.choose_action(&state, &masks);
                         let result = local_env.step(&action);
 
                         traj.states.push(state.clone());
@@ -397,18 +397,43 @@ pub mod burn_helpers {
         type State = Vec<f32>;
         type Action = T::TargetAction;
 
-        fn choose_action(&self, state: &Self::State, mask: &[bool]) -> (Self::Action, Vec<usize>, f32) {
+        fn choose_action(&self, state: &Self::State, masks: &[Vec<bool>]) -> (Self::Action, Vec<usize>, f32) {
             let state_tensor = Tensor::<B, 2>::from_data(TensorData::new(state.clone(), [1, state.len()]), &self.device);
             let head_logits = self.actor_net.forward(state_tensor);
+
+            // CONTRACT: Environment MUST provide exactly one mask per head.
+            // Empty vec![] means "no mask for this head" (explicit opt-out).
+            assert_eq!(
+                masks.len(),
+                head_logits.len(),
+                "FATAL: Environment contract violation! \
+                 Neural network has {} heads but get_action_mask() returned {} masks.",
+                head_logits.len(),
+                masks.len(),
+            );
 
             let mut selected_indices = Vec::new();
             let mut total_log_prob = 0.0;
 
             for (i, mut logits) in head_logits.into_iter().enumerate() {
-                if i == 0 && !mask.is_empty() {
-                    let mask_tensor = Tensor::<B, 2, Bool>::from_data(TensorData::new(mask.to_vec(), [1, mask.len()]), &self.device);
+                let head_size = logits.dims()[1];
+
+                if !masks[i].is_empty() {
+                    // CONTRACT: If a mask is provided, its length MUST match the head size.
+                    assert_eq!(
+                        masks[i].len(),
+                        head_size,
+                        "FATAL: Mask size mismatch at head {}! Expected {} but got {}.",
+                        i, head_size, masks[i].len(),
+                    );
+
+                    let mask_tensor = Tensor::<B, 2, Bool>::from_data(
+                        TensorData::new(masks[i].clone(), [1, head_size]),
+                        &self.device,
+                    );
                     logits = logits.mask_fill(mask_tensor.bool_not(), -1e9);
                 }
+
                 let probs = burn::tensor::activation::softmax(logits, 1);
                 let probs_vec = probs.into_data().to_vec::<f32>().expect("Failed to get Tensor data");
 
@@ -450,17 +475,37 @@ pub mod burn_helpers {
 
             let num_heads = trajectories[0].action_indices[0].len();
 
-            // 1. EXTRACT DATA: Must get S_t and S_next
-            for t in trajectories.iter().filter(|t| t.states.len() > 1 && t.reward != 0.0) {
-                for i in 0..(t.states.len() - 1) { // Skip last step (no next_state)
-                    all_s.extend_from_slice(&t.states[i]);
-                    all_sn.extend_from_slice(&t.states[i + 1]);
+            // Derive head_sizes from the network weights for One-Hot encoding
+            let head_sizes: Vec<usize> = self.net.actor.heads.iter().map(|h| {
+                let dims = h.weight.dims();
+                dims[dims.len() - 1]
+            }).collect();
+            let total_action_dims: usize = head_sizes.iter().sum();
+
+            // 1. EXTRACT DATA (Fixes: index mismatch, silent filter, one-hot encoding)
+            // - Iterate by action_indices.len(), NOT states.len() (run_fuzzing pushes 2 states per step)
+            // - Removed reward != 0.0 filter (was dropping all Hold trajectories)
+            for t in trajectories.iter().filter(|t| !t.action_indices.is_empty()) {
+                for i in 0..t.action_indices.len() {
+                    // S_t is at [2*i], S_{t+1} is at [2*i + 1]
+                    all_s.extend_from_slice(&t.states[2 * i]);
+                    all_sn.extend_from_slice(&t.states[2 * i + 1]);
 
                     let act_i64 = t.action_indices[i].iter().map(|&idx| idx as i64).collect::<Vec<_>>();
-                    let act_f32 = t.action_indices[i].iter().map(|&idx| idx as f32).collect::<Vec<_>>();
-
                     all_ai_i64.extend(act_i64);
-                    all_ai_f32.extend(act_f32);
+
+                    // One-Hot encode actions (categorical, not ordinal)
+                    let mut one_hot = vec![0.0f32; total_action_dims];
+                    let mut offset = 0;
+                    for (h, &val) in t.action_indices[i].iter().enumerate() {
+                        let size = head_sizes[h];
+                        if val < size {
+                            one_hot[offset + val] = 1.0;
+                        }
+                        offset += size;
+                    }
+                    all_ai_f32.extend(one_hot);
+
                     all_rewards.push(t.reward);
                 }
             }
@@ -473,7 +518,7 @@ pub mod burn_helpers {
             // 2. CONVERT TO TENSORS
             let states_tensor = Tensor::<B, 2>::from_data(TensorData::new(all_s, [total_steps, state_dim]), &self.device);
             let next_states_tensor = Tensor::<B, 2>::from_data(TensorData::new(all_sn, [total_steps, state_dim]), &self.device);
-            let actions_f32_tensor = Tensor::<B, 2>::from_data(TensorData::new(all_ai_f32, [total_steps, num_heads]), &self.device);
+            let actions_f32_tensor = Tensor::<B, 2>::from_data(TensorData::new(all_ai_f32, [total_steps, total_action_dims]), &self.device);
             let extrinsic_rewards = Tensor::<B, 1>::from_data(TensorData::new(all_rewards, [total_steps]), &self.device);
 
             // 3. FORWARD NET PREDICTS & COMPUTE CURIOSITY
@@ -525,7 +570,8 @@ pub mod burn_helpers {
         let device = Default::default();
 
         let actor = MultiHeadNet::<DefaultCpuBackend>::new(&device, input_size, hidden_size, head_sizes);
-        let forward_net = ForwardNet::<DefaultCpuBackend>::new(&device, input_size, head_sizes.len(), hidden_size);
+        let total_action_dims: usize = head_sizes.iter().sum();
+        let forward_net = ForwardNet::<DefaultCpuBackend>::new(&device, input_size, total_action_dims, hidden_size);
 
         let net = ICMNet { actor, forward_net };
         let optimizer = AdamConfig::new().init();
