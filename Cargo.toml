@@ -8,8 +8,10 @@ keywords = ["fuzzing", "ai", "reinforcement-learning", "testing"]
 categories = ["development-tools::testing"]
 
 [dependencies]
+burn = { version = "0.20.1", features = ["ndarray", "train", "autodiff"], optional = true }
+ndarray = { version = "0.17.2", features = ["blas", "rayon"] }
 rand = "0.10.0"
-burn = { version = "0.20.1", features = ["wgpu", "train"], optional = true }
+rayon = "1.11.0"
 
 [features]
 default = []
