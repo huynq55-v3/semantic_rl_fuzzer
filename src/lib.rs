@@ -16,10 +16,9 @@ pub enum OracleStatus {
 }
 
 /// The result returned by the Environment after executing a step.
+/// Contains only execution facts — semantic judgment is delegated to the TruthOracle.
 pub struct StepResult<S> {
     pub next_state: S,
-    pub reward: f32,
-    pub is_violated: bool,
     pub is_invalid: bool,
 }
 
@@ -48,15 +47,15 @@ impl<S: Clone, A: Clone> HybridReplayBuffer<S, A> {
         }
     }
 
-    /// Pushes a new trajectory into the buffer. Removes the oldest if at capacity.
+    /// Pushes a new trajectory into the buffer. Evicts using O(1) swap_remove.
     pub fn push_trajectory(&mut self, traj: Trajectory<S, A>) {
         if self.memory.len() >= self.capacity {
             // Find the FIRST "trash" element (not interesting) to evict
             if let Some(idx) = self.memory.iter().position(|t| !t.is_interesting) {
-                self.memory.remove(idx);
+                self.memory.swap_remove(idx); // O(1) instead of O(N)
             } else {
-                // If the entire buffer consists of high-quality trajectories (rare), delete the oldest one
-                self.memory.remove(0);
+                // If the entire buffer consists of high-quality trajectories (rare)
+                self.memory.swap_remove(0); // O(1) instead of O(N)
             }
         }
         self.memory.push(traj);
@@ -71,10 +70,11 @@ impl<S: Clone, A: Clone> HybridReplayBuffer<S, A> {
 
 // ==========================================
 // PART 2: THE INTERFACES (CONTRACTS)
-// The boundaries between the AI, the Target, and the Fuzzer Core.
+// The boundaries between the AI, the Target, the Oracle, and the Fuzzer Core.
 // ==========================================
 
 /// The interface that any fuzzing target (e.g., Bevy, Sled) must implement.
+/// Step should only execute the action — semantic judgment is delegated to TruthOracle.
 pub trait FuzzEnvironment {
     type State;
     type Action;
@@ -85,11 +85,20 @@ pub trait FuzzEnvironment {
     /// Returns a boolean mask indicating which actions are currently valid.
     fn get_action_mask(&self) -> Vec<bool>;
 
-    /// Executes the action, evaluates it against the Oracle, and returns the result.
+    /// Executes the action and returns the execution result.
+    /// Should NOT evaluate semantic correctness — that's the Oracle's job.
     fn step(&mut self, action: &Self::Action) -> StepResult<Self::State>;
 
     /// Resets the environment for a new episode.
     fn reset(&mut self);
+}
+
+/// The supreme judge. Completely decoupled from the Environment.
+/// Evaluates whether the Environment is violating any physical/logical invariants.
+pub trait TruthOracle<E: FuzzEnvironment> {
+    /// Judges the current state of the environment after an action was executed.
+    /// `is_invalid` indicates whether the action was syntactically invalid.
+    fn judge(&self, env: &mut E, is_invalid: bool) -> OracleStatus;
 }
 
 /// The interface for the AI model (e.g., a Burn Tensor Neural Network).
@@ -97,7 +106,8 @@ pub trait NeuralAgent {
     type State;
     type Action;
 
-    /// Takes the current state and valid action mask, returns the chosen action, indices (for multi-head), and its log probability.
+    /// Takes the current state and valid action mask, returns the chosen action,
+    /// indices (for multi-head), and its log probability.
     fn choose_action(&self, state: &Self::State, mask: &[bool]) -> (Self::Action, Vec<usize>, f32);
 
     /// Triggers the backpropagation process using a batch of past experiences.
@@ -106,24 +116,43 @@ pub trait NeuralAgent {
 
 // ==========================================
 // PART 3: THE ORCHESTRATOR
-// Binds the Environment and the Agent together.
+// Binds the Environment, the Agent, and the Oracle together.
 // ==========================================
 
-pub struct FuzzEngine<E: FuzzEnvironment, A: NeuralAgent<State = E::State, Action = E::Action>> {
+pub struct FuzzEngine<
+    E: FuzzEnvironment,
+    A: NeuralAgent<State = E::State, Action = E::Action>,
+    O: TruthOracle<E>,
+> {
     pub env: E,
     pub agent: A,
+    pub oracle: O,
     pub buffer: HybridReplayBuffer<E::State, E::Action>,
     pub max_steps_per_episode: usize,
     pub batch_size: usize,
 }
 
-impl<E: FuzzEnvironment, A: NeuralAgent<State = E::State, Action = E::Action>> FuzzEngine<E, A>
+impl<E: FuzzEnvironment, A: NeuralAgent<State = E::State, Action = E::Action>, O: TruthOracle<E>>
+    FuzzEngine<E, A, O>
 where
     E::State: Clone,
     E::Action: Clone + std::fmt::Debug,
 {
     /// Starts the main Reinforcement Learning fuzzing loop.
     pub fn run_fuzzing(&mut self, total_episodes: usize) {
+        // Background thread for non-blocking artifact writing
+        let (artifact_tx, artifact_rx) = std::sync::mpsc::channel::<(String, String)>();
+        let writer_thread = std::thread::spawn(move || {
+            use std::fs;
+            use std::io::Write;
+            let _ = fs::create_dir_all("artifacts");
+            for (filename, content) in artifact_rx {
+                if let Ok(mut file) = fs::File::create(&filename) {
+                    let _ = write!(file, "{}", content);
+                }
+            }
+        });
+
         for episode in 1..=total_episodes {
             self.env.reset();
 
@@ -147,40 +176,41 @@ where
                 current_traj.actions.push(action.clone());
                 current_traj.action_indices.push(indices);
                 current_traj.log_probs.push(log_prob);
-                current_traj.reward += result.reward;
 
-                if result.is_violated {
-                    println!(
-                        "🚨 [Episode {}] LOGIC BUG DETECTED! Terminating this episode!",
-                        episode
-                    );
-                    current_traj.is_interesting = true;
+                // DELEGATE JUDGMENT TO THE ORACLE
+                let status = self.oracle.judge(&mut self.env, result.is_invalid);
 
-                    // SAVE ARTIFACT TO DISK
-                    use std::fs;
-                    use std::io::Write;
-                    let _ = fs::create_dir_all("artifacts"); // Create directory if it doesn't exist
-                    let filename = format!("artifacts/bug_ep_{}.txt", episode);
-                    let mut file = fs::File::create(&filename).unwrap();
+                match status {
+                    OracleStatus::Violated => {
+                        println!(
+                            "🚨 [Episode {}] LOGIC BUG DETECTED! Terminating this episode!",
+                            episode
+                        );
+                        current_traj.is_interesting = true;
 
-                    // Write the translated Action array directly to the file
-                    writeln!(file, "Action sequence that crashed the system:").unwrap();
-                    for (i, a) in current_traj.actions.iter().enumerate() {
-                        writeln!(file, "{}. {:?}", i, a).unwrap();
+                        // Send artifact to background writer (non-blocking)
+                        let filename = format!("artifacts/bug_ep_{}.txt", episode);
+                        let mut content =
+                            String::from("Action sequence that crashed the system:\n");
+                        for (i, a) in current_traj.actions.iter().enumerate() {
+                            content.push_str(&format!("{}. {:?}\n", i, a));
+                        }
+                        let _ = artifact_tx.send((filename.clone(), content));
+                        println!("💾 Evidence queued for saving to {}", filename);
+
+                        break;
                     }
-                    println!("💾 Evidence saved to {}", filename);
-
-                    break;
-                }
-
-                if result.is_invalid {
-                    // Penalize the AI for generating an invalid action and abort the sequence.
-                    current_traj.reward -= 1.0;
-                    break;
+                    OracleStatus::Hold { reward } => {
+                        current_traj.reward += reward;
+                    }
+                    OracleStatus::Invalid => {
+                        current_traj.reward -= 1.0;
+                        break;
+                    }
                 }
             }
 
-            // Mark trajectories with positive returns as interesting seeds for future mutations.
+            // Mark trajectories with positive returns as interesting seeds.
             if current_traj.reward > 0.0 {
                 current_traj.is_interesting = true;
             }
@@ -189,16 +219,21 @@ where
             if episode % 50 == 0 {
                 println!("\n🔍 [DEBUG Episode {}] AI Mind Revealed:", episode);
                 println!("  - Total Reward: {:.2}", current_traj.reward);
-                println!("  - Sequence Length (Steps): {}", current_traj.actions.len());
+                println!(
+                    "  - Sequence Length (Steps): {}",
+                    current_traj.actions.len()
+                );
                 println!("  - Last 3 actions chosen by AI:");
 
-                // Lấy 3 action cuối (hoặc ít hơn nếu chuỗi ngắn)
                 let tail_len = current_traj.actions.len().min(3);
                 let start_idx = current_traj.actions.len() - tail_len;
 
                 for (i, action) in current_traj.actions[start_idx..].iter().enumerate() {
                     let prob_percent = current_traj.log_probs[start_idx + i].exp() * 100.0;
-                    println!("      + Command: {:?} (Confidence: {:.2}%)", action, prob_percent);
+                    println!(
+                        "      + Command: {:?} (Confidence: {:.2}%)",
+                        action, prob_percent
+                    );
                 }
             }
 
@@ -214,6 +249,10 @@ where
                 );
             }
         }
+
+        // Signal the background writer to finish and wait for it
+        drop(artifact_tx);
+        let _ = writer_thread.join();
     }
 }
 
@@ -235,14 +274,12 @@ pub mod burn_helpers {
     pub struct MultiHeadNet<B: Backend> {
         shared_layer_1: Linear<B>,
         shared_layer_2: Linear<B>,
-        // List of output layers (Heads). Each head is responsible for generating one parameter.
         heads: Vec<Linear<B>>,
         relu: Relu,
     }
 
     impl<B: Backend> MultiHeadNet<B> {
         /// Initializes the Neural Network with a dynamic number of heads.
-        /// Example: head_sizes = &[4, 100, 50] -> Will create 3 heads.
         pub fn new(
             device: &B::Device,
             input_size: usize,
@@ -266,13 +303,13 @@ pub mod burn_helpers {
         }
 
         /// Returns a list of Logit Tensors for each head.
+        /// Input shape: [batch, features] → Output: Vec of [batch, head_size] per head.
         pub fn forward(&self, state: Tensor<B, 2>) -> Vec<Tensor<B, 2>> {
             let x = self.shared_layer_1.forward(state);
             let x = self.relu.forward(x);
             let x = self.shared_layer_2.forward(x);
             let shared_features = self.relu.forward(x);
 
-            // Each head receives the same set of features but generates different outputs.
             self.heads
                 .iter()
                 .map(|head| head.forward(shared_features.clone()))
@@ -280,17 +317,15 @@ pub mod burn_helpers {
         }
     }
 
-    /// 2. ACTION TRANSLATOR (TRANSLATOR TRAIT)
-    /// Users must implement this trait to convert the AI's integer array into their own action Enum.
+    /// ACTION TRANSLATOR TRAIT
     pub trait ActionTranslator {
         type TargetAction;
-
-        /// Takes an array of IDs from the heads (e.g., [0, 42, 1]) -> Returns the actual Enum.
         fn translate(&self, head_outputs: &[usize]) -> Self::TargetAction;
     }
 
-    /// 3. AGENT WRAPPER (Automates all AI-related logic)
-    pub struct BurnAgent<B: AutodiffBackend, T: ActionTranslator, O: Optimizer<MultiHeadNet<B>, B>> {
+    /// AGENT WRAPPER (Automates all AI-related logic)
+    pub struct BurnAgent<B: AutodiffBackend, T: ActionTranslator, O: Optimizer<MultiHeadNet<B>, B>>
+    {
         pub net: MultiHeadNet<B>,
         pub translator: T,
         pub optimizer: O,
@@ -298,11 +333,10 @@ pub mod burn_helpers {
         pub device: B::Device,
     }
 
-    // Automatically implement the standard NeuralAgent from the core library.
     impl<B: AutodiffBackend, T: ActionTranslator, O: Optimizer<MultiHeadNet<B>, B>>
         super::NeuralAgent for BurnAgent<B, T, O>
     {
-        type State = Vec<f32>; // Input must be a float array
+        type State = Vec<f32>;
         type Action = T::TargetAction;
 
         fn choose_action(
@@ -310,43 +344,33 @@ pub mod burn_helpers {
             state: &Self::State,
             mask: &[bool],
         ) -> (Self::Action, Vec<usize>, f32) {
-            // 1. Convert Vec<f32> to Tensor [Batch=1, Features]
             let state_tensor =
                 Tensor::<B, 1>::from_data(state.as_slice(), &self.device).unsqueeze::<2>();
 
-            // 2. Run the Neural Network (Forward pass)
             let head_logits = self.net.forward(state_tensor);
 
             let mut selected_indices = Vec::new();
             let mut total_log_prob = 0.0;
 
-            // 3. Process each Head
             for (i, mut logits) in head_logits.into_iter().enumerate() {
-                // ACTION MASKING TECHNIQUE
                 if i == 0 && !mask.is_empty() {
                     let mask_data = TensorData::new(mask.to_vec(), [1, mask.len()]);
                     let mask_tensor = Tensor::<B, 2, Bool>::from_data(mask_data, &self.device);
                     logits = logits.mask_fill(mask_tensor.bool_not(), -1e9);
                 }
 
-                // Convert Logits to Probabilities (Softmax)
                 let probs = burn::tensor::activation::softmax(logits, 1);
                 let probs_vec = probs.into_data().to_vec::<f32>().unwrap();
 
-                // Sampling randomly based on probabilities
                 let mut rng = rng();
                 let dist = WeightedIndex::new(&probs_vec).unwrap();
                 let chosen_index = dist.sample(&mut rng);
 
                 selected_indices.push(chosen_index);
-
-                // Cumulative LogProb for REINFORCE calculation
                 total_log_prob += probs_vec[chosen_index].ln();
             }
 
-            // 4. Translate the array [0, 42, 1] into the system Enum using the translator
             let final_action = self.translator.translate(&selected_indices);
-
             (final_action, selected_indices, total_log_prob)
         }
 
@@ -359,11 +383,10 @@ pub mod burn_helpers {
                 return;
             }
 
-            // STEP 1: Reconstruct Tensor Graph from memory
+            // STEP 1: Reconstruct Tensor Graph from memory (VECTORIZED)
             let mut loss_tensors = Vec::new();
 
             for traj in trajectories {
-                // Skip invalid sequences
                 if traj.reward < 0.0 {
                     continue;
                 }
@@ -373,39 +396,43 @@ pub mod burn_helpers {
                     continue;
                 }
 
-                // Use the total episode return as the weight for REINFORCE
+                let state_feature_size = traj.states[0].len();
+
+                // VECTORIZED: Flatten all states into [step_count, features] — ONE GPU upload
+                let all_states_flat: Vec<f32> =
+                    traj.states.iter().flat_map(|s| s.iter().copied()).collect();
+                let states_tensor =
+                    Tensor::<B, 1>::from_data(all_states_flat.as_slice(), &self.device)
+                        .reshape([step_count, state_feature_size]);
+
+                // ONE batched forward pass — GPU processes all steps at once
+                let all_head_logits = self.net.forward(states_tensor);
+
                 let episode_return = traj.reward;
-                let reward_tensor = Tensor::<B, 1>::from_data([episode_return], &self.device);
+                let reward_tensor =
+                    Tensor::<B, 1>::from_data([episode_return], &self.device);
 
-                // Re-forward pass for each step in the episode
-                for i in 0..step_count {
-                    let state = &traj.states[i];
-                    let action_indices = &traj.action_indices[i];
+                // For each head, compute losses in batch using vectorized gather
+                for (h, logits) in all_head_logits.into_iter().enumerate() {
+                    // logits shape: [step_count, head_size]
+                    let probs = burn::tensor::activation::softmax(logits, 1);
 
-                    let state_tensor =
-                        Tensor::<B, 1>::from_data(state.as_slice(), &self.device).unsqueeze::<2>();
+                    // Build index tensor for this head across all steps: [step_count, 1]
+                    let indices: Vec<i64> =
+                        traj.action_indices.iter().map(|ai| ai[h] as i64).collect();
+                    let index_tensor =
+                        Tensor::<B, 1, Int>::from_data(indices.as_slice(), &self.device)
+                            .reshape([step_count, 1]);
 
-                    // Forward pass with Autodiff enabled
-                    let head_logits = self.net.forward(state_tensor);
+                    // Gather all chosen probabilities at once: [step_count, 1]
+                    let chosen_probs = probs.gather(1, index_tensor);
+                    let log_probs = chosen_probs.log();
 
-                    // For each head, calculate the log probability of the action that was actually taken
-                    for (h, logits) in head_logits.into_iter().enumerate() {
-                        let probs = burn::tensor::activation::softmax(logits, 1);
-
-                        // Select the probability of the index that was chosen during the episode
-                        let chosen_index = action_indices[h];
-                        let chosen_index_tensor =
-                            Tensor::<B, 1, Int>::from_data([chosen_index as i64], &self.device)
-                                .unsqueeze::<2>();
-
-                        let chosen_prob = probs.gather(1, chosen_index_tensor);
-                        let log_prob = chosen_prob.log();
-
-                        // REINFORCE formula: Loss = - (Reward * LogProb)
-                        // This forces the network to increase Prob(Action) if Reward is high
-                        let step_loss = log_prob.mul(reward_tensor.clone().unsqueeze::<2>()).neg();
-                        loss_tensors.push(step_loss.reshape([1]));
-                    }
+                    // REINFORCE: Loss = -(Reward * LogProb)
+                    // Broadcast reward across all steps in this trajectory
+                    let step_losses =
+                        log_probs.mul(reward_tensor.clone().unsqueeze::<2>()).neg();
+                    loss_tensors.push(step_losses.reshape([step_count]));
                 }
             }
 
@@ -436,7 +463,6 @@ pub mod burn_helpers {
     }
 
     /// GPU AGENT FACTORY (FACADE)
-    /// Hides the complexity of Burn's backend and device initialization.
     pub fn create_gpu_agent<T: ActionTranslator>(
         input_size: usize,
         hidden_size: usize,
@@ -450,11 +476,9 @@ pub mod burn_helpers {
     > {
         let device = WgpuDevice::DefaultDevice;
 
-        // Initialize the Multi-head Neural Network
         let net =
             MultiHeadNet::<DefaultGpuBackend>::new(&device, input_size, hidden_size, head_sizes);
 
-        // Initialize the Adam Optimizer
         let optimizer = AdamConfig::new().init();
 
         BurnAgent {
