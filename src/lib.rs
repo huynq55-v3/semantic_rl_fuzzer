@@ -602,8 +602,9 @@ pub mod burn_helpers {
             // TOTAL SCORE = ORACLE SCORE + (CURIOSITY * WEIGHT)
             // Detach so Actor cannot manipulate the Forward Net
             let intrinsic_weight = 0.5;
-            let total_rewards =
-                extrinsic_rewards.add(intrinsic_rewards.detach().mul_scalar(intrinsic_weight));
+            let total_rewards = extrinsic_rewards
+                .clone()
+                .add(intrinsic_rewards.clone().detach().mul_scalar(intrinsic_weight));
 
             for (h, logits) in all_head_logits.into_iter().enumerate() {
                 let probs = burn::tensor::activation::softmax(logits, 1);
@@ -626,7 +627,7 @@ pub mod burn_helpers {
             }
 
             // 5. UPDATE BOTH NETWORKS SIMULTANEOUSLY
-            let total_loss = total_actor_loss.add(forward_loss);
+            let total_loss = total_actor_loss.clone().add(forward_loss.clone());
             let gradients = total_loss.backward();
             let grads = GradientsParams::from_grads(gradients, &self.net);
             self.net = self
