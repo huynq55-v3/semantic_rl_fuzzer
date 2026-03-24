@@ -317,17 +317,17 @@ pub mod burn_helpers {
 
     impl<B: Backend> NoisyLinear<B> {
         pub fn new(device: &B::Device, d_in: usize, d_out: usize) -> Self {
-            let bound = (1.0 / d_in as f64).sqrt() as f32;
+            let bound = (1.0 / d_in as f64).sqrt();
 
             // mu initialized like a normal linear layer
             let mu_w = Tensor::<B, 2>::random(
                 [d_in, d_out],
-                burn::tensor::Distribution::Uniform(-bound.into(), bound.into()),
+                burn::tensor::Distribution::Uniform(-bound, bound),
                 device,
             );
             let mu_b = Tensor::<B, 1>::random(
                 [d_out],
-                burn::tensor::Distribution::Uniform(-bound.into(), bound.into()),
+                burn::tensor::Distribution::Uniform(-bound, bound),
                 device,
             );
 
