@@ -110,7 +110,9 @@ pub trait NeuralAgent: Send {
 
     /// Extract a thread-safe actor (no Autodiff) for parallel inference.
     fn get_actor(&self) -> Self::Actor;
-    fn learn_from_batch(&mut self, trajectories: &[Trajectory<Self::State, Self::Action>]);
+    fn learn_from_batch(&mut self, trajectories: &[Trajectory<Self::State, Self::Action>]) -> f32;
+    fn reset_forward_net(&mut self);
+    fn get_curiosity_threshold(&self) -> f32;
 }
 
 // ==========================================
@@ -259,6 +261,8 @@ where
                 }
             }
 
+            let current_curiosity = self.agent.learn_from_batch(&rollouts);
+
             // ==========================================
             // LOGGING & CALLBACK
             // ==========================================
@@ -272,6 +276,10 @@ where
                     "📊 [Iter {} | Ep {}] Avg Reward: {:.2} | Crashes: {} | Speed: {:.0} steps/s",
                     iteration, global_episodes, avg_reward, crashes_found, fps
                 );
+
+                if current_curiosity < self.agent.get_curiosity_threshold() && crashes_found == 0 {
+                    self.agent.reset_forward_net();
+                }
 
                 // Fire callback so consuming code can analyze the batch
                 on_log(iteration, &rollouts);
@@ -537,6 +545,7 @@ pub mod burn_helpers {
         pub intrinsic_weight: f32, // Hệ số Tò mò (eta)
         pub entropy_coeff: f32,    // Hệ số Entropy (beta)
         pub noise_floor: f32,      // Sàn nhiễu cho NoisyLinear
+        pub curiosity_threshold: f32,
     }
 
     #[derive(Clone)]
@@ -606,6 +615,29 @@ pub mod burn_helpers {
         type Action = T::TargetAction;
         type Actor = BurnActor<B::InnerBackend, T>;
 
+        fn reset_forward_net(&mut self) {
+            // 1. Lấy thông số từ actor_net để giữ nguyên cấu trúc
+            let weight_dims = self.actor_net.shared_layer_1.weight.dims();
+            let input_size = weight_dims[0];
+            let hidden_size = weight_dims[1];
+
+            let head_sizes: Vec<usize> = self.actor_net.heads.iter().map(|h| h.d_out).collect();
+            let total_action_dims: usize = head_sizes.iter().sum();
+
+            // 2. Khởi tạo mạng Forward mới tinh (Xóa sạch ký ức cũ)
+            self.forward_net =
+                ForwardNet::<B>::new(&self.device, input_size, total_action_dims, hidden_size);
+
+            // 🌟 LƯU Ý: Không gán lại self.fwd_opt ở đây để tránh lỗi Mismatched Types.
+            // Optimizer cũ sẽ tiếp tục làm việc với các trọng số mới của forward_net.
+
+            // 3. Xóa sạch bộ nhớ Replay Buffer để xóa bỏ "định kiến" cũ
+            self.replay_buffer.memory.clear();
+            self.replay_buffer.ptr = 0;
+
+            println!("🧠 [Hệ Thống] Đã Reset Nhà Tiên Tri - Thế giới trở nên mới lạ!");
+        }
+
         fn get_actor(&self) -> Self::Actor {
             BurnActor {
                 actor_net: self.actor_net.valid(),
@@ -615,10 +647,14 @@ pub mod burn_helpers {
             }
         }
 
+        fn get_curiosity_threshold(&self) -> f32 {
+            self.curiosity_threshold
+        }
+
         fn learn_from_batch(
             &mut self,
             trajectories: &[super::Trajectory<Self::State, Self::Action>],
-        ) {
+        ) -> f32 {
             let head_sizes: Vec<usize> = self.actor_net.heads.iter().map(|h| h.d_out).collect();
             let total_action_dims: usize = head_sizes.iter().sum();
 
@@ -655,7 +691,7 @@ pub mod burn_helpers {
             }
 
             if all_s.is_empty() {
-                return;
+                return 0.0;
             }
             let total_steps = all_rewards.len();
             let state_dim = trajectories[0].states[0].len();
@@ -812,6 +848,8 @@ pub mod burn_helpers {
                 "🔥 Batch ({} steps) | Replay Mem: {}/{} | Int_μ: {:.4} | Act_Loss: {:.4} | Fwd_Loss: {:.4}",
                 total_steps, self.replay_buffer.memory.len(), self.replay_buffer.capacity, avg_curiosity, avg_actor_loss, avg_fwd_loss
             );
+
+            avg_curiosity
         }
     }
 
@@ -824,6 +862,7 @@ pub mod burn_helpers {
         intrinsic_weight: f32,
         entropy_coeff: f32,
         noise_floor: f32,
+        curiosity_threshold: f32,
     ) -> BurnAgent<
         DefaultCpuBackend,
         T,
@@ -859,6 +898,7 @@ pub mod burn_helpers {
             intrinsic_weight,
             entropy_coeff,
             noise_floor,
+            curiosity_threshold,
         }
     }
 }
