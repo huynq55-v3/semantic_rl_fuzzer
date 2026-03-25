@@ -544,6 +544,7 @@ pub mod burn_helpers {
         pub intrinsic_weight: f32, // Hệ số Tò mò (eta)
         pub entropy_coeff: f32,    // Hệ số Entropy (beta)
         pub noise_floor: f32,      // Sàn nhiễu cho NoisyLinear
+        pub batch_size: usize,        // 🌟 Thêm trường này
         pub curiosity_threshold: f32,
     }
 
@@ -700,7 +701,7 @@ pub mod burn_helpers {
             // Ép Tiên Tri ôn lại bài cũ 10 lần (Epochs) để không bao giờ quên
             // ==========================================
             let fwd_epochs = 5;
-            let fwd_batch_size = 1024.min(self.replay_buffer.memory.len());
+            let fwd_batch_size = self.batch_size.min(self.replay_buffer.memory.len());
             let mut avg_fwd_loss = 0.0;
 
             if self.replay_buffer.memory.len() >= fwd_batch_size {
@@ -742,7 +743,7 @@ pub mod burn_helpers {
             // PHASE 2: TRAIN ACTOR (ON-POLICY MINI-BATCH)
             // Băm nhỏ 51,200 steps ra thành từng mẻ 1024 để tiêu hóa
             // ==========================================
-            let actor_batch_size = 1024;
+            let actor_batch_size = self.batch_size;
             let num_batches = (total_steps + actor_batch_size - 1) / actor_batch_size;
             let mut avg_actor_loss = 0.0;
             let mut avg_curiosity = 0.0;
@@ -862,6 +863,8 @@ pub mod burn_helpers {
         entropy_coeff: f32,
         noise_floor: f32,
         curiosity_threshold: f32,
+        batch_size: usize,      // 🌟 Tham số mới
+        buffer_capacity: usize, // 🌟 Tham số mới
     ) -> BurnAgent<
         DefaultCpuBackend,
         T,
@@ -893,10 +896,11 @@ pub mod burn_helpers {
             learning_rate,
             device,
             // Sổ tay 100,000 steps cho Nhà Tiên Tri
-            replay_buffer: ForwardReplayBuffer::new(100_000),
+            replay_buffer: ForwardReplayBuffer::new(buffer_capacity), // 🌟 Truyền động vào đây
             intrinsic_weight,
             entropy_coeff,
             noise_floor,
+            batch_size, // 🌟 Lưu vào struct
             curiosity_threshold,
         }
     }
