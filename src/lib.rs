@@ -734,7 +734,9 @@ pub mod burn_helpers {
                     .to_vec::<f32>()
                     .unwrap()[0];
 
-                let intrinsic_weight = 10;
+                let scale_factor = (state_dim as f32 / 15.0).max(1.0);
+                let intrinsic_weight = 10.0 * scale_factor;
+
                 let total_rewards = ext_rew_tens.add(int_rewards.mul_scalar(intrinsic_weight));
 
                 let all_head_logits = self.actor_net.forward(s_tens);
