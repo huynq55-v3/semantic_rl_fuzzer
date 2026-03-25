@@ -399,6 +399,10 @@ pub mod burn_helpers {
         }
 
         pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+            self.forward_with_floor(x, 0.0)
+        }
+
+        pub fn forward_with_floor(&self, x: Tensor<B, 2>, floor: f32) -> Tensor<B, 2> {
             let [_, d_in] = x.dims();
             let d_out = self.d_out;
 
@@ -413,8 +417,12 @@ pub mod burn_helpers {
                 &x.device(),
             );
 
-            let weight = self.mu_w.val().add(self.sig_w.val().mul(eps_w));
-            let bias = self.mu_b.val().add(self.sig_b.val().mul(eps_b));
+            // Mechanims to keep sig_w from reaching 0
+            let sig_w = self.sig_w.val().clamp_min(floor as f64);
+            let sig_b = self.sig_b.val().clamp_min(floor as f64);
+
+            let weight = self.mu_w.val().add(sig_w.mul(eps_w));
+            let bias = self.mu_b.val().add(sig_b.mul(eps_b));
 
             x.matmul(weight).add(bias.unsqueeze_dim(0))
         }
@@ -453,13 +461,17 @@ pub mod burn_helpers {
         }
 
         pub fn forward(&self, state: Tensor<B, 2>) -> Vec<Tensor<B, 2>> {
+            self.forward_with_floor(state, 0.0)
+        }
+
+        pub fn forward_with_floor(&self, state: Tensor<B, 2>, floor: f32) -> Vec<Tensor<B, 2>> {
             let x = self.shared_layer_1.forward(state);
             let x = self.relu.forward(x);
             let x = self.shared_layer_2.forward(x);
             let shared_features = self.relu.forward(x);
             self.heads
                 .iter()
-                .map(|head| head.forward(shared_features.clone()))
+                .map(|head| head.forward_with_floor(shared_features.clone(), floor))
                 .collect()
         }
     }
@@ -521,7 +533,10 @@ pub mod burn_helpers {
         pub translator: T,
         pub learning_rate: f64,
         pub device: B::Device,
-        pub replay_buffer: ForwardReplayBuffer, // Trí nhớ 100,000 steps
+        pub replay_buffer: ForwardReplayBuffer,
+        pub intrinsic_weight: f32, // Hệ số Tò mò (eta)
+        pub entropy_coeff: f32,    // Hệ số Entropy (beta)
+        pub noise_floor: f32,      // Sàn nhiễu cho NoisyLinear
     }
 
     #[derive(Clone)]
@@ -529,6 +544,7 @@ pub mod burn_helpers {
         pub actor_net: MultiHeadNet<B>,
         pub translator: T,
         pub device: B::Device,
+        pub noise_floor: f32,
     }
 
     impl<B: Backend, T: ActionTranslator> super::FuzzActor for BurnActor<B, T> {
@@ -544,7 +560,9 @@ pub mod burn_helpers {
                 TensorData::new(state.clone(), [1, state.len()]),
                 &self.device,
             );
-            let head_logits = self.actor_net.forward(state_tensor);
+            let head_logits = self
+                .actor_net
+                .forward_with_floor(state_tensor, self.noise_floor);
 
             let mut selected_indices = Vec::new();
             let mut total_log_prob = 0.0;
@@ -593,6 +611,7 @@ pub mod burn_helpers {
                 actor_net: self.actor_net.valid(),
                 translator: self.translator.clone(),
                 device: self.device.clone(),
+                noise_floor: self.noise_floor,
             }
         }
 
@@ -735,18 +754,23 @@ pub mod burn_helpers {
                     .unwrap()[0];
 
                 let scale_factor = (state_dim as f32 / 15.0).max(1.0);
-                let intrinsic_weight = 10.0 * scale_factor;
+                let intrinsic_weight = self.intrinsic_weight * scale_factor;
 
-                let total_rewards = ext_rew_tens.add(int_rewards.mul_scalar(intrinsic_weight));
+                let total_rewards =
+                    ext_rew_tens.add(int_rewards.mul_scalar(intrinsic_weight as f64));
 
-                let all_head_logits = self.actor_net.forward(s_tens);
+                let all_head_logits = self.actor_net.forward_with_floor(s_tens, self.noise_floor);
                 let mut actor_loss_sum = Tensor::<B, 1>::from_data([0.0], &self.device);
 
                 let num_heads = head_sizes.len();
                 for (h, logits) in all_head_logits.into_iter().enumerate() {
-                    let probs = burn::tensor::activation::softmax(logits, 1);
+                    let probs = burn::tensor::activation::softmax(logits.clone(), 1);
+                    let log_probs_all = burn::tensor::activation::log_softmax(logits, 1);
 
-                    // Lấy index hành động tương ứng cho Head này trong mini-batch
+                    // 1. Calculate Entropy: H = -sum(p * log(p))
+                    let entropy = probs.clone().mul(log_probs_all).sum_dim(1).neg().mean();
+
+                    // 2. Calculate Policy Loss
                     let mb_a_i64: Vec<i64> = all_ai_i64[start * num_heads..end * num_heads]
                         .iter()
                         .skip(h)
@@ -760,9 +784,12 @@ pub mod burn_helpers {
                     );
 
                     let safe_probs = probs.gather(1, index_tensor).clamp_min(1e-8);
-                    let log_probs = safe_probs.log().reshape([current_batch_size]);
+                    let log_probs_selected = safe_probs.log().reshape([current_batch_size]);
 
-                    let head_loss = log_probs.mul(total_rewards.clone()).neg().mean();
+                    let policy_loss = log_probs_selected.mul(total_rewards.clone()).neg().mean();
+
+                    // 3. Combined Loss: Total_Head_Loss = Policy_Loss - (beta * Entropy)
+                    let head_loss = policy_loss.sub(entropy.mul_scalar(self.entropy_coeff as f64));
                     actor_loss_sum = actor_loss_sum.add(head_loss);
                 }
 
@@ -794,6 +821,9 @@ pub mod burn_helpers {
         head_sizes: &[usize],
         learning_rate: f64,
         translator: T,
+        intrinsic_weight: f32,
+        entropy_coeff: f32,
+        noise_floor: f32,
     ) -> BurnAgent<
         DefaultCpuBackend,
         T,
@@ -826,6 +856,9 @@ pub mod burn_helpers {
             device,
             // Sổ tay 100,000 steps cho Nhà Tiên Tri
             replay_buffer: ForwardReplayBuffer::new(100_000),
+            intrinsic_weight,
+            entropy_coeff,
+            noise_floor,
         }
     }
 }
