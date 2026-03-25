@@ -285,7 +285,6 @@ where
                 on_log(iteration, &rollouts);
             }
 
-            self.agent.learn_from_batch(&rollouts);
             rollouts.clear();
         }
 
