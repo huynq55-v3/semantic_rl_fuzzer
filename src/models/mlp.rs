@@ -1,6 +1,8 @@
 use burn::nn::{Linear, LinearConfig, Relu};
 use burn::prelude::*;
 
+use crate::models::LOGIT_NOISE_MULTIPLIER;
+
 #[derive(Module, Debug)]
 pub struct MlpActor<B: Backend> {
     pub shared_layer_1: Linear<B>,
@@ -43,7 +45,10 @@ impl<B: Backend> MlpActor<B> {
                 if floor > 0.0 {
                     let noise = Tensor::<B, 2>::random(
                         logits.dims(),
-                        burn::tensor::Distribution::Normal(0.0, floor as f64),
+                        burn::tensor::Distribution::Normal(
+                            0.0,
+                            floor as f64 * LOGIT_NOISE_MULTIPLIER,
+                        ),
                         &logits.device(),
                     );
                     logits.add(noise)

@@ -68,3 +68,5 @@ impl<B: Backend> ForwardArchitecture<B> {
         }
     }
 }
+
+const LOGIT_NOISE_MULTIPLIER: f64 = 40.0;
