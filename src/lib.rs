@@ -295,10 +295,9 @@ where
 
 #[cfg(feature = "burn-backend")]
 pub mod burn_helpers {
-    use burn::backend::ndarray::NdArray;
     use burn::backend::Autodiff;
-    use burn::module::AutodiffModule;
-    use burn::module::Param;
+    use burn::module::{AutodiffModule, Param};
+    use burn::nn::attention::{MhaInput, MultiHeadAttention, MultiHeadAttentionConfig};
     use burn::nn::{Linear, LinearConfig, Relu};
     use burn::optim::{AdamConfig, GradientsParams, Optimizer};
     use burn::prelude::*;
@@ -306,11 +305,8 @@ pub mod burn_helpers {
     use rand::distr::{weighted::WeightedIndex, Distribution, Uniform};
     use rand::rng;
 
-    pub type DefaultCpuBackend = Autodiff<NdArray>;
-
     // ==========================================
-    // TRÍ NHỚ DÀI HẠN (OFF-POLICY REPLAY BUFFER)
-    // Lưu trữ kinh nghiệm quá khứ để Nhà Tiên Tri không bị "não cá vàng"
+    // TRÍ NHỚ DÀI HẠN (Replay Buffer) - Giữ nguyên
     // ==========================================
     #[derive(Clone)]
     pub struct Transition {
@@ -367,7 +363,7 @@ pub mod burn_helpers {
     }
 
     // ==========================================
-    // DEEPMIND'S NOISY LINEAR LAYER
+    // DEEPMIND'S NOISY LINEAR (Sửa lại chuẩn)
     // ==========================================
     #[derive(Module, Debug)]
     pub struct NoisyLinear<B: Backend> {
@@ -391,11 +387,9 @@ pub mod burn_helpers {
                 burn::tensor::Distribution::Uniform(-bound, bound),
                 device,
             );
-
             let sig_init = 0.5 / (d_in as f32).sqrt();
             let sig_w = Tensor::<B, 2>::zeros([d_in, d_out], device).add_scalar(sig_init);
             let sig_b = Tensor::<B, 1>::zeros([d_out], device).add_scalar(sig_init);
-
             Self {
                 mu_w: Param::from_tensor(mu_w),
                 sig_w: Param::from_tensor(sig_w),
@@ -405,77 +399,82 @@ pub mod burn_helpers {
             }
         }
 
-        pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-            self.forward_with_floor(x, 0.0)
-        }
-
+        // 🌟 NOISY LINEAR CHỈ TRẢ VỀ 1 TENSOR (Không phải Vec)
         pub fn forward_with_floor(&self, x: Tensor<B, 2>, floor: f32) -> Tensor<B, 2> {
             let [_, d_in] = x.dims();
-            let d_out = self.d_out;
-
             let eps_w = Tensor::<B, 2>::random(
-                [d_in, d_out],
+                [d_in, self.d_out],
                 burn::tensor::Distribution::Normal(0.0, 1.0),
                 &x.device(),
             );
             let eps_b = Tensor::<B, 1>::random(
-                [d_out],
+                [self.d_out],
                 burn::tensor::Distribution::Normal(0.0, 1.0),
                 &x.device(),
             );
-
-            // Mechanims to keep sig_w from reaching 0
             let sig_w = self.sig_w.val().clamp_min(floor as f64);
             let sig_b = self.sig_b.val().clamp_min(floor as f64);
-
             let weight = self.mu_w.val().add(sig_w.mul(eps_w));
             let bias = self.mu_b.val().add(sig_b.mul(eps_b));
-
             x.matmul(weight).add(bias.unsqueeze_dim(0))
         }
     }
 
     // ==========================================
-    // 1. ACTOR NETWORK
+    // 1. MINI TRANSFORMER ACTOR (Khối logic riêng biệt)
     // ==========================================
     #[derive(Module, Debug)]
-    pub struct MultiHeadNet<B: Backend> {
-        shared_layer_1: Linear<B>,
-        shared_layer_2: Linear<B>,
+    pub struct InvariantTransformerNet<B: Backend> {
+        pub token_proj: Linear<B>,
+        pub attention: MultiHeadAttention<B>,
+        pub fc_out: Linear<B>,
         pub heads: Vec<NoisyLinear<B>>,
-        relu: Relu,
+        pub relu: Relu,
     }
 
-    impl<B: Backend> MultiHeadNet<B> {
+    impl<B: Backend> InvariantTransformerNet<B> {
         pub fn new(
             device: &B::Device,
-            input_size: usize,
-            hidden_size: usize,
+            _input_size: usize,
+            d_model: usize,
             head_sizes: &[usize],
         ) -> Self {
-            let shared_layer_1 = LinearConfig::new(input_size, hidden_size).init(device);
-            let shared_layer_2 = LinearConfig::new(hidden_size, hidden_size).init(device);
+            let token_proj = LinearConfig::new(1, d_model).init(device);
+            let attention = MultiHeadAttentionConfig::new(d_model, 4).init(device);
+            let fc_out = LinearConfig::new(d_model, d_model).init(device);
+
             let mut heads = Vec::new();
             for &size in head_sizes {
-                heads.push(NoisyLinear::new(device, hidden_size, size));
+                heads.push(NoisyLinear::new(device, d_model, size));
             }
+
             Self {
-                shared_layer_1,
-                shared_layer_2,
+                token_proj,
+                attention,
+                fc_out,
                 heads,
                 relu: Relu::new(),
             }
         }
 
-        pub fn forward(&self, state: Tensor<B, 2>) -> Vec<Tensor<B, 2>> {
-            self.forward_with_floor(state, 0.0)
-        }
-
         pub fn forward_with_floor(&self, state: Tensor<B, 2>, floor: f32) -> Vec<Tensor<B, 2>> {
-            let x = self.shared_layer_1.forward(state);
-            let x = self.relu.forward(x);
-            let x = self.shared_layer_2.forward(x);
-            let shared_features = self.relu.forward(x);
+            let [batch_size, seq_len] = state.dims();
+            let x_seq = state.reshape([batch_size, seq_len, 1]);
+
+            let x_proj = self.token_proj.forward(x_seq);
+
+            // 🌟 SỬA LỖI API BURN: Gói vào MhaInput
+            let mha_input = MhaInput::self_attn(x_proj);
+            let mha_output = self.attention.forward(mha_input);
+
+            // 🌟 Lấy context tensor từ Output
+            let x_attn = mha_output.context;
+
+            let x_pooled: Tensor<B, 2> = x_attn.mean_dim(1).squeeze();
+
+            let shared_features = self.relu.forward(self.fc_out.forward(x_pooled));
+
+            // Map qua các heads (Action Types, Index 1, Index 2...)
             self.heads
                 .iter()
                 .map(|head| head.forward_with_floor(shared_features.clone(), floor))
@@ -484,7 +483,8 @@ pub mod burn_helpers {
     }
 
     // ==========================================
-    // 2. FORWARD NETWORK
+    // 2. FORWARD NETWORK (Cũng có thể dùng MLP cho nhẹ, hoặc đổi sang MiniTransformer tương tự)
+    // Ở đây giữ MLP để tính toán nhanh, vì nó chỉ dự đoán next_state
     // ==========================================
     #[derive(Module, Debug)]
     pub struct ForwardNet<B: Backend> {
@@ -509,13 +509,10 @@ pub mod burn_helpers {
                 relu: Relu::new(),
             }
         }
-
         pub fn forward(&self, state: Tensor<B, 2>, action_indices: Tensor<B, 2>) -> Tensor<B, 2> {
             let x = Tensor::cat(vec![state, action_indices], 1);
-            let x = self.fc_1.forward(x);
-            let x = self.relu.forward(x);
-            let x = self.fc_2.forward(x);
-            let x = self.relu.forward(x);
+            let x = self.relu.forward(self.fc_1.forward(x));
+            let x = self.relu.forward(self.fc_2.forward(x));
             self.out.forward(x)
         }
     }
@@ -526,14 +523,10 @@ pub mod burn_helpers {
     }
 
     // ==========================================
-    // BỘ NÃO TÁCH RỜI (DUAL OPTIMIZERS)
+    // TÁI CẤU TRÚC AGENT VỚI GENERIC BACKEND
     // ==========================================
-    pub struct BurnAgent<B: AutodiffBackend, T: ActionTranslator, ActorO, FwdO>
-    where
-        ActorO: Optimizer<MultiHeadNet<B>, B>,
-        FwdO: Optimizer<ForwardNet<B>, B>,
-    {
-        pub actor_net: MultiHeadNet<B>,
+    pub struct BurnAgent<B: AutodiffBackend, T: ActionTranslator, ActorO, FwdO> {
+        pub actor_net: InvariantTransformerNet<B>,
         pub forward_net: ForwardNet<B>,
         pub actor_opt: ActorO,
         pub fwd_opt: FwdO,
@@ -541,16 +534,16 @@ pub mod burn_helpers {
         pub learning_rate: f64,
         pub device: B::Device,
         pub replay_buffer: ForwardReplayBuffer,
-        pub intrinsic_weight: f32, // Hệ số Tò mò (eta)
-        pub entropy_coeff: f32,    // Hệ số Entropy (beta)
-        pub noise_floor: f32,      // Sàn nhiễu cho NoisyLinear
-        pub batch_size: usize,        // 🌟 Thêm trường này
+        pub intrinsic_weight: f32,
+        pub entropy_coeff: f32,
+        pub noise_floor: f32,
+        pub batch_size: usize,
         pub curiosity_threshold: f32,
     }
 
     #[derive(Clone)]
     pub struct BurnActor<B: Backend, T: ActionTranslator> {
-        pub actor_net: MultiHeadNet<B>,
+        pub actor_net: InvariantTransformerNet<B>,
         pub translator: T,
         pub device: B::Device,
         pub noise_floor: f32,
@@ -587,28 +580,25 @@ pub mod burn_helpers {
                 }
 
                 let probs = burn::tensor::activation::softmax(logits, 1);
-                let probs_vec = probs
-                    .into_data()
-                    .to_vec::<f32>()
-                    .expect("Failed to get Tensor data");
-
+                let probs_vec = probs.into_data().to_vec::<f32>().unwrap();
                 let mut rng = rng();
-                let dist = WeightedIndex::new(&probs_vec).unwrap();
-                let chosen_index = dist.sample(&mut rng);
+                let chosen_index = WeightedIndex::new(&probs_vec).unwrap().sample(&mut rng);
 
                 selected_indices.push(chosen_index);
                 total_log_prob += probs_vec[chosen_index].ln();
             }
-
-            let final_action = self.translator.translate(&selected_indices);
-            (final_action, selected_indices, total_log_prob)
+            (
+                self.translator.translate(&selected_indices),
+                selected_indices,
+                total_log_prob,
+            )
         }
     }
 
     impl<B: AutodiffBackend, T: ActionTranslator, ActorO, FwdO> super::NeuralAgent
         for BurnAgent<B, T, ActorO, FwdO>
     where
-        ActorO: Optimizer<MultiHeadNet<B>, B>,
+        ActorO: Optimizer<InvariantTransformerNet<B>, B>,
         FwdO: Optimizer<ForwardNet<B>, B>,
     {
         type State = Vec<f32>;
@@ -616,25 +606,17 @@ pub mod burn_helpers {
         type Actor = BurnActor<B::InnerBackend, T>;
 
         fn reset_forward_net(&mut self) {
-            // 1. Lấy thông số từ actor_net để giữ nguyên cấu trúc
-            let weight_dims = self.actor_net.shared_layer_1.weight.dims();
-            let input_size = weight_dims[0];
-            let hidden_size = weight_dims[1];
-
             let head_sizes: Vec<usize> = self.actor_net.heads.iter().map(|h| h.d_out).collect();
             let total_action_dims: usize = head_sizes.iter().sum();
 
-            // 2. Khởi tạo mạng Forward mới tinh (Xóa sạch ký ức cũ)
+            // Lấy lại config cũ để build lại FwdNet (Giả sử hidden_dim của FwdNet trùng d_model của Actor cho gọn)
+            let hidden_dim = self.actor_net.fc_out.weight.dims()[1];
+            let input_size = self.forward_net.out.weight.dims()[1]; // out: [hidden -> state_dim]
+
             self.forward_net =
-                ForwardNet::<B>::new(&self.device, input_size, total_action_dims, hidden_size);
-
-            // 🌟 LƯU Ý: Không gán lại self.fwd_opt ở đây để tránh lỗi Mismatched Types.
-            // Optimizer cũ sẽ tiếp tục làm việc với các trọng số mới của forward_net.
-
-            // 3. Xóa sạch bộ nhớ Replay Buffer để xóa bỏ "định kiến" cũ
+                ForwardNet::<B>::new(&self.device, input_size, total_action_dims, hidden_dim);
             self.replay_buffer.memory.clear();
             self.replay_buffer.ptr = 0;
-
             println!("🧠 [Hệ Thống] Đã Reset Nhà Tiên Tri - Thế giới trở nên mới lạ!");
         }
 
@@ -653,39 +635,55 @@ pub mod burn_helpers {
 
         fn learn_from_batch(
             &mut self,
+
             trajectories: &[super::Trajectory<Self::State, Self::Action>],
         ) -> f32 {
             let head_sizes: Vec<usize> = self.actor_net.heads.iter().map(|h| h.d_out).collect();
+
             let total_action_dims: usize = head_sizes.iter().sum();
 
             let mut all_s = Vec::new();
+
             let mut all_sn = Vec::new();
+
             let mut all_ai_i64 = Vec::new();
+
             let mut all_ai_f32 = Vec::new();
+
             let mut all_rewards = Vec::new();
 
             // 1. GOM DỮ LIỆU & BƠM VÀO KHO TRÍ NHỚ
+
             for t in trajectories.iter().filter(|t| !t.action_indices.is_empty()) {
                 for i in 0..t.action_indices.len() {
                     let s_t = &t.states[2 * i];
+
                     let s_n = &t.states[2 * i + 1];
 
                     all_s.extend_from_slice(s_t);
+
                     all_sn.extend_from_slice(s_n);
+
                     all_ai_i64.extend(t.action_indices[i].iter().map(|&idx| idx as i64));
 
                     let mut one_hot = vec![0.0f32; total_action_dims];
+
                     let mut offset = 0;
+
                     for (h, &val) in t.action_indices[i].iter().enumerate() {
                         if val < head_sizes[h] {
                             one_hot[offset + val] = 1.0;
                         }
+
                         offset += head_sizes[h];
                     }
+
                     all_ai_f32.extend(one_hot.clone());
+
                     all_rewards.push(t.reward);
 
                     // Đẩy dữ liệu vào kho lưu trữ Dài hạn
+
                     self.replay_buffer.push(s_t, &one_hot, s_n);
                 }
             }
@@ -693,15 +691,23 @@ pub mod burn_helpers {
             if all_s.is_empty() {
                 return 0.0;
             }
+
             let total_steps = all_rewards.len();
+
             let state_dim = trajectories[0].states[0].len();
 
             // ==========================================
+
             // PHASE 1: TRAIN FORWARD NET (OFF-POLICY MINI-BATCH)
+
             // Ép Tiên Tri ôn lại bài cũ 10 lần (Epochs) để không bao giờ quên
+
             // ==========================================
+
             let fwd_epochs = 5;
+
             let fwd_batch_size = self.batch_size.min(self.replay_buffer.memory.len());
+
             let mut avg_fwd_loss = 0.0;
 
             if self.replay_buffer.memory.len() >= fwd_batch_size {
@@ -712,76 +718,102 @@ pub mod burn_helpers {
                         TensorData::new(b_s, [fwd_batch_size, state_dim]),
                         &self.device,
                     );
+
                     let a_tens = Tensor::<B, 2>::from_data(
                         TensorData::new(b_a, [fwd_batch_size, total_action_dims]),
                         &self.device,
                     );
+
                     let sn_tens = Tensor::<B, 2>::from_data(
                         TensorData::new(b_sn, [fwd_batch_size, state_dim]),
                         &self.device,
                     );
 
                     let pred_sn = self.forward_net.forward(s_tens, a_tens);
+
                     let fwd_loss = (pred_sn - sn_tens).powf_scalar(2.0).mean();
 
                     avg_fwd_loss += fwd_loss.clone().into_data().to_vec::<f32>().unwrap()[0];
 
                     let fwd_grads = fwd_loss.backward();
+
                     let fwd_grads_params =
                         GradientsParams::from_grads(fwd_grads, &self.forward_net);
+
                     // Dùng Optimizer riêng cho Tiên Tri
+
                     self.forward_net = self.fwd_opt.step(
                         self.learning_rate,
                         self.forward_net.clone(),
                         fwd_grads_params,
                     );
                 }
+
                 avg_fwd_loss /= fwd_epochs as f32;
             }
 
             // ==========================================
+
             // PHASE 2: TRAIN ACTOR (ON-POLICY MINI-BATCH)
+
             // Băm nhỏ 51,200 steps ra thành từng mẻ 1024 để tiêu hóa
+
             // ==========================================
+
             let actor_batch_size = self.batch_size;
+
             let num_batches = (total_steps + actor_batch_size - 1) / actor_batch_size;
+
             let mut avg_actor_loss = 0.0;
+
             let mut avg_curiosity = 0.0;
 
             for b in 0..num_batches {
                 let start = b * actor_batch_size;
+
                 let end = (start + actor_batch_size).min(total_steps);
+
                 let current_batch_size = end - start;
 
                 let mb_s = all_s[start * state_dim..end * state_dim].to_vec();
+
                 let mb_sn = all_sn[start * state_dim..end * state_dim].to_vec();
+
                 let mb_a_f32 =
                     all_ai_f32[start * total_action_dims..end * total_action_dims].to_vec();
+
                 let mb_rew = all_rewards[start..end].to_vec();
 
                 let s_tens = Tensor::<B, 2>::from_data(
                     TensorData::new(mb_s, [current_batch_size, state_dim]),
                     &self.device,
                 );
+
                 let sn_tens = Tensor::<B, 2>::from_data(
                     TensorData::new(mb_sn, [current_batch_size, state_dim]),
                     &self.device,
                 );
+
                 let a_tens = Tensor::<B, 2>::from_data(
                     TensorData::new(mb_a_f32, [current_batch_size, total_action_dims]),
                     &self.device,
                 );
+
                 let ext_rew_tens = Tensor::<B, 1>::from_data(
                     TensorData::new(mb_rew, [current_batch_size]),
                     &self.device,
                 );
 
                 // Dùng ForwardNet VỪA ĐƯỢC CẬP NHẬT để tính điểm tò mò (Không Backprop cho FwdNet ở đây)
+
                 let pred_sn = self.forward_net.forward(s_tens.clone(), a_tens);
+
                 let mse = (pred_sn - sn_tens).powf_scalar(2.0);
 
                 // Detach để gradient không lan sang Forward Net
+
                 let int_rewards = mse.mean_dim(1).reshape([current_batch_size]).detach();
+
                 avg_curiosity += int_rewards
                     .clone()
                     .mean()
@@ -790,23 +822,29 @@ pub mod burn_helpers {
                     .unwrap()[0];
 
                 let scale_factor = (state_dim as f32 / 15.0).max(1.0);
+
                 let intrinsic_weight = self.intrinsic_weight * scale_factor;
 
                 let total_rewards =
                     ext_rew_tens.add(int_rewards.mul_scalar(intrinsic_weight as f64));
 
                 let all_head_logits = self.actor_net.forward_with_floor(s_tens, self.noise_floor);
+
                 let mut actor_loss_sum = Tensor::<B, 1>::from_data([0.0], &self.device);
 
                 let num_heads = head_sizes.len();
+
                 for (h, logits) in all_head_logits.into_iter().enumerate() {
                     let probs = burn::tensor::activation::softmax(logits.clone(), 1);
+
                     let log_probs_all = burn::tensor::activation::log_softmax(logits, 1);
 
                     // 1. Calculate Entropy: H = -sum(p * log(p))
+
                     let entropy = probs.clone().mul(log_probs_all).sum_dim(1).neg().mean();
 
                     // 2. Calculate Policy Loss
+
                     let mb_a_i64: Vec<i64> = all_ai_i64[start * num_heads..end * num_heads]
                         .iter()
                         .skip(h)
@@ -820,20 +858,26 @@ pub mod burn_helpers {
                     );
 
                     let safe_probs = probs.gather(1, index_tensor).clamp_min(1e-8);
+
                     let log_probs_selected = safe_probs.log().reshape([current_batch_size]);
 
                     let policy_loss = log_probs_selected.mul(total_rewards.clone()).neg().mean();
 
                     // 3. Combined Loss: Total_Head_Loss = Policy_Loss - (beta * Entropy)
+
                     let head_loss = policy_loss.sub(entropy.mul_scalar(self.entropy_coeff as f64));
+
                     actor_loss_sum = actor_loss_sum.add(head_loss);
                 }
 
                 avg_actor_loss += actor_loss_sum.clone().into_data().to_vec::<f32>().unwrap()[0];
 
                 // Cập nhật ĐỘC LẬP cho Actor Net
+
                 let actor_grads = actor_loss_sum.backward();
+
                 let actor_grads_params = GradientsParams::from_grads(actor_grads, &self.actor_net);
+
                 self.actor_net = self.actor_opt.step(
                     self.learning_rate,
                     self.actor_net.clone(),
@@ -842,20 +886,28 @@ pub mod burn_helpers {
             }
 
             avg_actor_loss /= num_batches as f32;
+
             avg_curiosity /= num_batches as f32;
 
             println!(
+
                 "🔥 Batch ({} steps) | Replay Mem: {}/{} | Int_μ: {:.4} | Act_Loss: {:.4} | Fwd_Loss: {:.4}",
+
                 total_steps, self.replay_buffer.memory.len(), self.replay_buffer.capacity, avg_curiosity, avg_actor_loss, avg_fwd_loss
+
             );
 
             avg_curiosity
         }
     }
 
-    pub fn create_cpu_agent<T: ActionTranslator>(
+    // ==========================================
+    // API SÁNG TẠO AGENT MỚI (Hỗ trợ GPU/CPU)
+    // ==========================================
+    pub fn create_agent<B: AutodiffBackend, T: ActionTranslator>(
+        device: &B::Device, // Truyền thiết bị vào (CPU / WGPU / CUDA)
         input_size: usize,
-        hidden_size: usize,
+        d_model: usize, // Thay vì hidden_size to đùng, giờ chỉ cần d_model (ví dụ 64 hoặc 128)
         head_sizes: &[usize],
         learning_rate: f64,
         translator: T,
@@ -863,27 +915,19 @@ pub mod burn_helpers {
         entropy_coeff: f32,
         noise_floor: f32,
         curiosity_threshold: f32,
-        batch_size: usize,      // 🌟 Tham số mới
-        buffer_capacity: usize, // 🌟 Tham số mới
+        batch_size: usize,
+        buffer_capacity: usize,
     ) -> BurnAgent<
-        DefaultCpuBackend,
+        B,
         T,
-        impl Optimizer<MultiHeadNet<DefaultCpuBackend>, DefaultCpuBackend>,
-        impl Optimizer<ForwardNet<DefaultCpuBackend>, DefaultCpuBackend>,
+        impl Optimizer<InvariantTransformerNet<B>, B>,
+        impl Optimizer<ForwardNet<B>, B>,
     > {
-        let device = Default::default();
+        let actor_net = InvariantTransformerNet::<B>::new(device, input_size, d_model, head_sizes);
 
-        let actor_net =
-            MultiHeadNet::<DefaultCpuBackend>::new(&device, input_size, hidden_size, head_sizes);
         let total_action_dims: usize = head_sizes.iter().sum();
-        let forward_net = ForwardNet::<DefaultCpuBackend>::new(
-            &device,
-            input_size,
-            total_action_dims,
-            hidden_size,
-        );
+        let forward_net = ForwardNet::<B>::new(device, input_size, total_action_dims, d_model * 2);
 
-        // Khởi tạo 2 Optimizer riêng biệt
         let actor_opt = AdamConfig::new().init();
         let fwd_opt = AdamConfig::new().init();
 
@@ -894,13 +938,12 @@ pub mod burn_helpers {
             fwd_opt,
             translator,
             learning_rate,
-            device,
-            // Sổ tay 100,000 steps cho Nhà Tiên Tri
-            replay_buffer: ForwardReplayBuffer::new(buffer_capacity), // 🌟 Truyền động vào đây
+            device: device.clone(),
+            replay_buffer: ForwardReplayBuffer::new(buffer_capacity),
             intrinsic_weight,
             entropy_coeff,
             noise_floor,
-            batch_size, // 🌟 Lưu vào struct
+            batch_size,
             curiosity_threshold,
         }
     }
