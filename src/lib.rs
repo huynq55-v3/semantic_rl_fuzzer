@@ -458,64 +458,46 @@ pub mod burn_helpers {
     }
 
     // ==========================================
-    // 1. MINI TRANSFORMER ACTOR (Khối logic riêng biệt)
+    // 1. ACTOR NETWORK
     // ==========================================
     #[derive(Module, Debug)]
-    pub struct InvariantTransformerNet<B: Backend> {
-        pub token_proj: Linear<B>,
-        pub attention: MultiHeadAttention<B>,
-        pub fc_out: Linear<B>,
+    pub struct MultiHeadNet<B: Backend> {
+        shared_layer_1: Linear<B>,
+        shared_layer_2: Linear<B>,
         pub heads: Vec<NoisyLinear<B>>,
-        pub relu: Relu,
+        relu: Relu,
     }
 
-    impl<B: Backend> InvariantTransformerNet<B> {
+    impl<B: Backend> MultiHeadNet<B> {
         pub fn new(
             device: &B::Device,
-            _input_size: usize,
-            d_model: usize,
+            input_size: usize,
+            hidden_size: usize,
             head_sizes: &[usize],
         ) -> Self {
-            let token_proj = LinearConfig::new(1, d_model).init(device);
-            let attention = MultiHeadAttentionConfig::new(d_model, 4).init(device);
-            let fc_out = LinearConfig::new(d_model, d_model).init(device);
-
+            let shared_layer_1 = LinearConfig::new(input_size, hidden_size).init(device);
+            let shared_layer_2 = LinearConfig::new(hidden_size, hidden_size).init(device);
             let mut heads = Vec::new();
             for &size in head_sizes {
-                heads.push(NoisyLinear::new(device, d_model, size));
+                heads.push(NoisyLinear::new(device, hidden_size, size));
             }
-
             Self {
-                token_proj,
-                attention,
-                fc_out,
+                shared_layer_1,
+                shared_layer_2,
                 heads,
                 relu: Relu::new(),
             }
         }
 
+        pub fn forward(&self, state: Tensor<B, 2>) -> Vec<Tensor<B, 2>> {
+            self.forward_with_floor(state, 0.0)
+        }
+
         pub fn forward_with_floor(&self, state: Tensor<B, 2>, floor: f32) -> Vec<Tensor<B, 2>> {
-            let [batch_size, seq_len] = state.dims();
-            let x_seq = state.reshape([batch_size, seq_len, 1]);
-
-            let x_proj = self.token_proj.forward(x_seq);
-
-            // 🌟 SỬA LỖI API BURN: Gói vào MhaInput
-            let mha_input = MhaInput::self_attn(x_proj);
-            let mha_output = self.attention.forward(mha_input);
-
-            // 🌟 Lấy context tensor từ Output
-            let x_attn = mha_output.context;
-
-            // 1. Lấy thông số chiều thực tế của Tensor 3D (Không hardcode)
-            let [batch_size, _seq_len, d_model] = x_attn.dims();
-
-            // 2. Dùng RESHAPE thay vì SQUEEZE: Đảm bảo luôn ra chuẩn 2 chiều [Batch, d_model]
-            let x_pooled = x_attn.mean_dim(1).reshape([batch_size, d_model]);
-
-            let shared_features = self.relu.forward(self.fc_out.forward(x_pooled));
-
-            // Map qua các heads (Action Types, Index 1, Index 2...)
+            let x = self.shared_layer_1.forward(state);
+            let x = self.relu.forward(x);
+            let x = self.shared_layer_2.forward(x);
+            let shared_features = self.relu.forward(x);
             self.heads
                 .iter()
                 .map(|head| head.forward_with_floor(shared_features.clone(), floor))
@@ -567,7 +549,7 @@ pub mod burn_helpers {
     // TÁI CẤU TRÚC AGENT VỚI GENERIC BACKEND
     // ==========================================
     pub struct BurnAgent<B: AutodiffBackend, T: ActionTranslator, ActorO, FwdO> {
-        pub actor_net: InvariantTransformerNet<B>,
+        pub actor_net: MultiHeadNet<B>,
         pub forward_net: ForwardNet<B>,
         pub actor_opt: ActorO,
         pub fwd_opt: FwdO,
@@ -584,7 +566,7 @@ pub mod burn_helpers {
 
     #[derive(Clone)]
     pub struct BurnActor<B: Backend, T: ActionTranslator> {
-        pub actor_net: InvariantTransformerNet<B>,
+        pub actor_net: MultiHeadNet<B>,
         pub translator: T,
         pub device: B::Device,
         pub noise_floor: f32,
@@ -743,7 +725,7 @@ pub mod burn_helpers {
     impl<B: AutodiffBackend, T: ActionTranslator, ActorO, FwdO> super::NeuralAgent
         for BurnAgent<B, T, ActorO, FwdO>
     where
-        ActorO: Optimizer<InvariantTransformerNet<B>, B>,
+        ActorO: Optimizer<MultiHeadNet<B>, B>,
         FwdO: Optimizer<ForwardNet<B>, B>,
     {
         type State = Vec<f32>;
@@ -751,17 +733,25 @@ pub mod burn_helpers {
         type Actor = BurnActor<B::InnerBackend, T>;
 
         fn reset_forward_net(&mut self) {
+            // 1. Lấy thông số từ actor_net để giữ nguyên cấu trúc
+            let weight_dims = self.actor_net.shared_layer_1.weight.dims();
+            let input_size = weight_dims[0];
+            let hidden_size = weight_dims[1];
+
             let head_sizes: Vec<usize> = self.actor_net.heads.iter().map(|h| h.d_out).collect();
             let total_action_dims: usize = head_sizes.iter().sum();
 
-            // Lấy lại config cũ để build lại FwdNet (Giả sử hidden_dim của FwdNet trùng d_model của Actor cho gọn)
-            let hidden_dim = self.actor_net.fc_out.weight.dims()[1];
-            let input_size = self.forward_net.out.weight.dims()[1]; // out: [hidden -> state_dim]
-
+            // 2. Khởi tạo mạng Forward mới tinh (Xóa sạch ký ức cũ)
             self.forward_net =
-                ForwardNet::<B>::new(&self.device, input_size, total_action_dims, hidden_dim);
+                ForwardNet::<B>::new(&self.device, input_size, total_action_dims, hidden_size);
+
+            // 🌟 LƯU Ý: Không gán lại self.fwd_opt ở đây để tránh lỗi Mismatched Types.
+            // Optimizer cũ sẽ tiếp tục làm việc với các trọng số mới của forward_net.
+
+            // 3. Xóa sạch bộ nhớ Replay Buffer để xóa bỏ "định kiến" cũ
             self.replay_buffer.memory.clear();
             self.replay_buffer.ptr = 0;
+
             println!("🧠 [Hệ Thống] Đã Reset Nhà Tiên Tri - Thế giới trở nên mới lạ!");
         }
 
@@ -1062,13 +1052,8 @@ pub mod burn_helpers {
         curiosity_threshold: f32,
         batch_size: usize,
         buffer_capacity: usize,
-    ) -> BurnAgent<
-        B,
-        T,
-        impl Optimizer<InvariantTransformerNet<B>, B>,
-        impl Optimizer<ForwardNet<B>, B>,
-    > {
-        let actor_net = InvariantTransformerNet::<B>::new(device, input_size, d_model, head_sizes);
+    ) -> BurnAgent<B, T, impl Optimizer<MultiHeadNet<B>, B>, impl Optimizer<ForwardNet<B>, B>> {
+        let actor_net = MultiHeadNet::<B>::new(device, input_size, d_model, head_sizes);
 
         let total_action_dims: usize = head_sizes.iter().sum();
         let forward_net = ForwardNet::<B>::new(device, input_size, total_action_dims, d_model * 2);
