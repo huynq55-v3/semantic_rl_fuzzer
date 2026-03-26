@@ -462,10 +462,12 @@ where
                 let log_probs_selected = safe_probs.log().reshape([current_batch_size]);
 
                 let policy_loss = log_probs_selected.mul(total_rewards.clone()).neg().mean();
-                let head_loss = policy_loss.sub(entropy.mul_scalar(self.entropy_coeff as f64));
+                let head_loss =
+                    policy_loss.sub(entropy.clone().mul_scalar(self.entropy_coeff as f64));
                 actor_loss_sum = actor_loss_sum.add(head_loss);
 
-                avg_entropy += entropy.into_data().to_vec::<f32>().unwrap()[0] / (num_heads as f32);
+                avg_entropy +=
+                    entropy.into_data().to_vec::<f32>().unwrap()[0] / (head_sizes.len() as f32);
             }
 
             avg_actor_loss += actor_loss_sum.clone().into_data().to_vec::<f32>().unwrap()[0];
