@@ -197,6 +197,7 @@ where
             // ==========================================
             for _step in 0..max_steps {
                 // Bước 1: Thu thập State và Mask cực nhanh bằng Rayon
+                // Đây chính là state TRƯỚC KHI hành động
                 let current_states: Vec<E::State> =
                     envs.par_iter().map(|e| e.get_state()).collect();
 
@@ -206,29 +207,32 @@ where
                 // Bước 2: BATCH INFERENCE - Gửi toàn bộ lên GPU trong 1 lệnh duy nhất!
                 let batch_results = actor.choose_batch_action(&current_states, &current_masks);
 
-                // Bước 3: Áp dụng Action vào các Environment song song trên CPU
+                // Bước 3: Áp dụng Action vào các Environment song song (Dùng luôn current_states đã lấy)
                 let step_results: Vec<_> = envs
                     .par_iter_mut()
+                    .zip(current_states.into_par_iter()) // 🌟 ZIP LUN STATE Ở BƯỚC 1 VÀO ĐÂY
                     .zip(batch_results.into_par_iter())
                     .zip(active_mask.par_iter())
-                    .map(|((env, (action, indices, log_prob)), &is_active)| {
-                        if !is_active {
-                            return None;
-                        }
+                    .map(
+                        |(((env, state_before), (action, indices, log_prob)), &is_active)| {
+                            if !is_active {
+                                return None;
+                            }
 
-                        let state_before = env.get_state();
-                        let result = env.step(&action);
-                        let status = oracle_ref.judge(env, result.is_invalid);
+                            // 🌟 KHÔNG GỌI `env.get_state()` Ở ĐÂY NỮA, DÙNG LUÔN `state_before`
+                            let result = env.step(&action);
+                            let status = oracle_ref.judge(env, result.is_invalid);
 
-                        Some((
-                            state_before,
-                            action,
-                            indices,
-                            log_prob,
-                            result.next_state,
-                            status,
-                        ))
-                    })
+                            Some((
+                                state_before, // Đã an toàn và đồng bộ tuyệt đối
+                                action,
+                                indices,
+                                log_prob,
+                                result.next_state,
+                                status,
+                            ))
+                        },
+                    )
                     .collect();
 
                 // Bước 4: Cập nhật Trajectories và kiểm tra điều kiện dừng
@@ -400,71 +404,13 @@ pub mod burn_helpers {
     }
 
     // ==========================================
-    // DEEPMIND'S NOISY LINEAR (Sửa lại chuẩn)
-    // ==========================================
-    #[derive(Module, Debug)]
-    pub struct NoisyLinear<B: Backend> {
-        pub mu_w: Param<Tensor<B, 2>>,
-        pub sig_w: Param<Tensor<B, 2>>,
-        pub mu_b: Param<Tensor<B, 1>>,
-        pub sig_b: Param<Tensor<B, 1>>,
-        pub d_out: usize,
-    }
-
-    impl<B: Backend> NoisyLinear<B> {
-        pub fn new(device: &B::Device, d_in: usize, d_out: usize) -> Self {
-            let bound = (1.0 / d_in as f64).sqrt();
-            let mu_w = Tensor::<B, 2>::random(
-                [d_in, d_out],
-                burn::tensor::Distribution::Uniform(-bound, bound),
-                device,
-            );
-            let mu_b = Tensor::<B, 1>::random(
-                [d_out],
-                burn::tensor::Distribution::Uniform(-bound, bound),
-                device,
-            );
-            let sig_init = 0.5 / (d_in as f32).sqrt();
-            let sig_w = Tensor::<B, 2>::zeros([d_in, d_out], device).add_scalar(sig_init);
-            let sig_b = Tensor::<B, 1>::zeros([d_out], device).add_scalar(sig_init);
-            Self {
-                mu_w: Param::from_tensor(mu_w),
-                sig_w: Param::from_tensor(sig_w),
-                mu_b: Param::from_tensor(mu_b),
-                sig_b: Param::from_tensor(sig_b),
-                d_out,
-            }
-        }
-
-        // 🌟 NOISY LINEAR CHỈ TRẢ VỀ 1 TENSOR (Không phải Vec)
-        pub fn forward_with_floor(&self, x: Tensor<B, 2>, floor: f32) -> Tensor<B, 2> {
-            let [_, d_in] = x.dims();
-            let eps_w = Tensor::<B, 2>::random(
-                [d_in, self.d_out],
-                burn::tensor::Distribution::Normal(0.0, 1.0),
-                &x.device(),
-            );
-            let eps_b = Tensor::<B, 1>::random(
-                [self.d_out],
-                burn::tensor::Distribution::Normal(0.0, 1.0),
-                &x.device(),
-            );
-            let sig_w = self.sig_w.val().clamp_min(floor as f64);
-            let sig_b = self.sig_b.val().clamp_min(floor as f64);
-            let weight = self.mu_w.val().add(sig_w.mul(eps_w));
-            let bias = self.mu_b.val().add(sig_b.mul(eps_b));
-            x.matmul(weight).add(bias.unsqueeze_dim(0))
-        }
-    }
-
-    // ==========================================
-    // 1. ACTOR NETWORK
+    // 1. ACTOR NETWORK (Loại bỏ Noisy, Dùng Linear Thuần)
     // ==========================================
     #[derive(Module, Debug)]
     pub struct MultiHeadNet<B: Backend> {
         shared_layer_1: Linear<B>,
         shared_layer_2: Linear<B>,
-        pub heads: Vec<NoisyLinear<B>>,
+        pub heads: Vec<Linear<B>>, // 🌟 Đổi về Linear thường
         relu: Relu,
     }
 
@@ -479,7 +425,7 @@ pub mod burn_helpers {
             let shared_layer_2 = LinearConfig::new(hidden_size, hidden_size).init(device);
             let mut heads = Vec::new();
             for &size in head_sizes {
-                heads.push(NoisyLinear::new(device, hidden_size, size));
+                heads.push(LinearConfig::new(hidden_size, size).init(device)); // 🌟 Dùng LinearConfig
             }
             Self {
                 shared_layer_1,
@@ -489,18 +435,15 @@ pub mod burn_helpers {
             }
         }
 
-        pub fn forward(&self, state: Tensor<B, 2>) -> Vec<Tensor<B, 2>> {
-            self.forward_with_floor(state, 0.0)
-        }
-
-        pub fn forward_with_floor(&self, state: Tensor<B, 2>, floor: f32) -> Vec<Tensor<B, 2>> {
+        pub fn forward_with_floor(&self, state: Tensor<B, 2>, _floor: f32) -> Vec<Tensor<B, 2>> {
+            // Không cần floor nữa vì không có nhiễu
             let x = self.shared_layer_1.forward(state);
             let x = self.relu.forward(x);
             let x = self.shared_layer_2.forward(x);
             let shared_features = self.relu.forward(x);
             self.heads
                 .iter()
-                .map(|head| head.forward_with_floor(shared_features.clone(), floor))
+                .map(|head| head.forward(shared_features.clone())) // 🌟 Gọi forward bình thường
                 .collect()
         }
     }
@@ -738,7 +681,12 @@ pub mod burn_helpers {
             let input_size = weight_dims[0];
             let hidden_size = weight_dims[1];
 
-            let head_sizes: Vec<usize> = self.actor_net.heads.iter().map(|h| h.d_out).collect();
+            let head_sizes: Vec<usize> = self
+                .actor_net
+                .heads
+                .iter()
+                .map(|h| h.weight.dims()[1])
+                .collect();
             let total_action_dims: usize = head_sizes.iter().sum();
 
             // 2. Khởi tạo mạng Forward mới tinh (Xóa sạch ký ức cũ)
@@ -773,7 +721,12 @@ pub mod burn_helpers {
 
             trajectories: &[super::Trajectory<Self::State, Self::Action>],
         ) -> f32 {
-            let head_sizes: Vec<usize> = self.actor_net.heads.iter().map(|h| h.d_out).collect();
+            let head_sizes: Vec<usize> = self
+                .actor_net
+                .heads
+                .iter()
+                .map(|h| h.weight.dims()[1])
+                .collect();
 
             let total_action_dims: usize = head_sizes.iter().sum();
 
