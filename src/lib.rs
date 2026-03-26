@@ -435,15 +435,30 @@ pub mod burn_helpers {
             }
         }
 
-        pub fn forward_with_floor(&self, state: Tensor<B, 2>, _floor: f32) -> Vec<Tensor<B, 2>> {
-            // Không cần floor nữa vì không có nhiễu
+        pub fn forward_with_floor(&self, state: Tensor<B, 2>, floor: f32) -> Vec<Tensor<B, 2>> {
             let x = self.shared_layer_1.forward(state);
             let x = self.relu.forward(x);
             let x = self.shared_layer_2.forward(x);
             let shared_features = self.relu.forward(x);
+
             self.heads
                 .iter()
-                .map(|head| head.forward(shared_features.clone())) // 🌟 Gọi forward bình thường
+                .map(|head| {
+                    let logits = head.forward(shared_features.clone());
+
+                    // 🌟 PHỤC HỒI MA GIÁO: Bơm Nhiễu (Noise) thẳng vào Logits
+                    // Nếu floor > 0, nó sẽ làm rung lắc bảng xác suất, ép AI phải mò mẫm
+                    if floor > 0.0 {
+                        let noise = Tensor::<B, 2>::random(
+                            logits.dims(),
+                            burn::tensor::Distribution::Normal(0.0, floor as f64),
+                            &logits.device(),
+                        );
+                        logits.add(noise)
+                    } else {
+                        logits
+                    }
+                })
                 .collect()
         }
     }
@@ -991,7 +1006,7 @@ pub mod burn_helpers {
         let actor_net = MultiHeadNet::<B>::new(device, input_size, d_model, head_sizes);
 
         let total_action_dims: usize = head_sizes.iter().sum();
-        let forward_net = ForwardNet::<B>::new(device, input_size, total_action_dims, d_model * 2);
+        let forward_net = ForwardNet::<B>::new(device, input_size, total_action_dims, d_model);
 
         let actor_opt = AdamConfig::new().init();
         let fwd_opt = AdamConfig::new().init();
