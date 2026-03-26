@@ -470,7 +470,11 @@ pub mod burn_helpers {
             // 🌟 Lấy context tensor từ Output
             let x_attn = mha_output.context;
 
-            let x_pooled: Tensor<B, 2> = x_attn.mean_dim(1).squeeze();
+            // 1. Lấy thông số chiều thực tế của Tensor 3D (Không hardcode)
+            let [batch_size, _seq_len, d_model] = x_attn.dims();
+
+            // 2. Dùng RESHAPE thay vì SQUEEZE: Đảm bảo luôn ra chuẩn 2 chiều [Batch, d_model]
+            let x_pooled = x_attn.mean_dim(1).reshape([batch_size, d_model]);
 
             let shared_features = self.relu.forward(self.fc_out.forward(x_pooled));
 
