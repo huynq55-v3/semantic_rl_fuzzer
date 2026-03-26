@@ -381,6 +381,7 @@ where
         let num_batches = (total_steps + actor_batch_size - 1) / actor_batch_size;
         let mut avg_actor_loss = 0.0;
         let mut avg_curiosity = 0.0;
+        let mut avg_entropy = 0.0;
 
         for b in 0..num_batches {
             let start = b * actor_batch_size;
@@ -463,6 +464,8 @@ where
                 let policy_loss = log_probs_selected.mul(total_rewards.clone()).neg().mean();
                 let head_loss = policy_loss.sub(entropy.mul_scalar(self.entropy_coeff as f64));
                 actor_loss_sum = actor_loss_sum.add(head_loss);
+
+                avg_entropy += entropy.into_data().to_vec::<f32>().unwrap()[0] / (num_heads as f32);
             }
 
             avg_actor_loss += actor_loss_sum.clone().into_data().to_vec::<f32>().unwrap()[0];
@@ -478,15 +481,15 @@ where
 
         avg_actor_loss /= num_batches as f32;
         avg_curiosity /= num_batches as f32;
+        avg_entropy /= num_batches as f32;
 
         // 🌟 KHÔI PHỤC LOG EMONJI TRONG AGENT
         println!(
-            "🔥 [Batch] {} steps | Replay Mem: {}/{} | Int_μ: {:.4} | Act_Loss: {:.4} | Fwd_Loss: {:.4}",
+            "🔥 [Batch] {:>5} steps | F(Loss): {:>7.4} = U - T*S(Entropy: {:>5.4}) | Tò_mò(Fuel): {:>6.4} | Fwd_Loss: {:>6.4}",
             total_steps,
-            self.replay_buffer.memory.len(),
-            self.replay_buffer.capacity,
-            avg_curiosity,
             avg_actor_loss,
+            avg_entropy,
+            avg_curiosity,
             avg_fwd_loss
         );
     }
