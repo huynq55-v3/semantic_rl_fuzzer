@@ -566,45 +566,40 @@ pub mod burn_helpers {
             masks_batch: &[Vec<Vec<bool>>],
         ) -> Vec<(Self::Action, Vec<usize>, f32)> {
             let batch_size = states.len();
-            if batch_size == 0 {
-                return Vec::new();
-            }
-
             let state_dim = states[0].len();
 
-            // 1. Gom tất cả state thành 1 vector phẳng duy nhất [batch_size * state_dim]
+            // 1. Đẩy 1 cục lên GPU
             let mut flattened_states = Vec::with_capacity(batch_size * state_dim);
-            for state in states {
-                flattened_states.extend_from_slice(state);
+            for s in states {
+                flattened_states.extend_from_slice(s);
             }
 
-            // 2. Ép vào 1 Tensor 2D khổng lồ để đẩy lên GPU 1 lần
             let state_tensor = Tensor::<B, 2>::from_data(
                 TensorData::new(flattened_states, [batch_size, state_dim]),
                 &self.device,
             );
 
-            // 3. Inference qua Neural Net 1 lần duy nhất cho toàn bộ Environment!
-            let all_head_logits = self
+            // 2. Chạy qua mạng nơ-ron
+            let head_logits = self
                 .actor_net
                 .forward_with_floor(state_tensor, self.noise_floor);
-            let num_heads = all_head_logits.len();
+            let num_heads = head_logits.len();
 
-            // Kéo toàn bộ probability của mọi heads về CPU một lần để phân giải
-            let mut heads_probs_vecs: Vec<Vec<f32>> = Vec::with_capacity(num_heads);
+            // 3. Xử lý Softmax và kéo về CPU theo từng Head
+            let mut heads_probs_vecs = Vec::with_capacity(num_heads);
             let mut heads_sizes = Vec::with_capacity(num_heads);
 
-            for (h, logits) in all_head_logits.into_iter().enumerate() {
+            for (i, mut logits) in head_logits.into_iter().enumerate() {
                 let head_size = logits.dims()[1];
                 heads_sizes.push(head_size);
 
-                // Áp dụng Mask cho nguyên cả lô
+                // Áp Mask y hệt choose_action (nhưng cho cả Batch)
                 let mut flat_mask = Vec::with_capacity(batch_size * head_size);
                 for b in 0..batch_size {
-                    if masks_batch[b][h].is_empty() {
+                    if masks_batch[b][i].is_empty() {
                         flat_mask.extend(std::iter::repeat(true).take(head_size));
                     } else {
-                        flat_mask.extend(masks_batch[b][h].iter().copied());
+                        flat_mask.extend(masks_batch[b][i].iter().copied());
                     }
                 }
 
@@ -612,56 +607,43 @@ pub mod burn_helpers {
                     TensorData::new(flat_mask, [batch_size, head_size]),
                     &self.device,
                 );
+                logits = logits.mask_fill(mask_tensor.bool_not(), -1e9);
 
-                let masked_logits = logits.mask_fill(mask_tensor.bool_not(), -1e9);
-                let probs = burn::tensor::activation::softmax(masked_logits, 1);
-
-                // Tải kết quả về RAM (CPU) một lần
+                // Softmax và kéo về RAM
+                let probs = burn::tensor::activation::softmax(logits, 1);
                 heads_probs_vecs.push(probs.into_data().to_vec::<f32>().unwrap());
             }
 
+            // 4. "Bốc thăm" song song bằng Rayon - Logic copy-paste từ bản đơn lẻ
             let translator = &self.translator;
-
-            // 4. Sample Action song song trên CPU cực mượt với Rayon
-            let results: Vec<_> = (0..batch_size)
+            (0..batch_size)
                 .into_par_iter()
                 .map(|b| {
                     let mut selected_indices = Vec::with_capacity(num_heads);
                     let mut total_log_prob = 0.0;
-                    let mut rng = rng();
+                    let mut rng = rand::rng();
 
                     for h in 0..num_heads {
-                        let head_size = heads_sizes[h];
-                        let start_idx = b * head_size;
-                        let end_idx = start_idx + head_size;
-                        let head_probs = &heads_probs_vecs[h][start_idx..end_idx];
+                        let h_size = heads_sizes[h];
+                        let start = b * h_size;
+                        let end = start + h_size;
+                        let probs_slice = &heads_probs_vecs[h][start..end];
 
-                        // Sample sử dụng WeightedIndex
-                        let dist_result = WeightedIndex::new(head_probs);
-                        let chosen_index = match dist_result {
-                            Ok(dist) => dist.sample(&mut rng),
-                            Err(_) => {
-                                // Fallback nếu xác suất bằng 0 hết (hiếm khi xảy ra)
-                                if !masks_batch[b][h].is_empty() {
-                                    masks_batch[b][h].iter().position(|&v| v).unwrap_or(0)
-                                } else {
-                                    0
-                                }
-                            }
-                        };
+                        // 🌟 ĐÂY RỒI: Y hệt bản cũ của ông, dùng unwrap() thẳng mặt
+                        let dist = WeightedIndex::new(probs_slice).unwrap();
+                        let chosen_index = dist.sample(&mut rng);
 
                         selected_indices.push(chosen_index);
-                        let prob = head_probs[chosen_index].max(1e-8); // Tránh ln(0)
-                        total_log_prob += prob.ln();
+                        total_log_prob += probs_slice[chosen_index].ln();
                     }
 
-                    // 🌟 SỬA Ở ĐÂY: Dùng biến `translator` thay vì `self.translator`
-                    let action = translator.translate(&selected_indices);
-                    (action, selected_indices, total_log_prob)
+                    (
+                        translator.translate(&selected_indices),
+                        selected_indices,
+                        total_log_prob,
+                    )
                 })
-                .collect();
-
-            results
+                .collect()
         }
     }
 
