@@ -286,7 +286,7 @@ where
     fn learn_from_batch(
         &mut self,
         trajectories: &[crate::core::Trajectory<Self::State, Self::Action>],
-    ) -> f32 {
+    ) {
         let head_sizes = self.actor_net.head_sizes();
         let total_action_dims: usize = head_sizes.iter().sum();
 
@@ -321,7 +321,7 @@ where
         }
 
         if all_s.is_empty() {
-            return 0.0;
+            return;
         }
 
         let total_steps = all_rewards.len();
@@ -455,8 +455,6 @@ where
 
         println!("[Batch] {} steps | Replay Mem: {}/{} | Int_μ: {:.4} | Act_Loss: {:.4} | Fwd_Loss: {:.4}", 
             total_steps, self.replay_buffer.memory.len(), self.replay_buffer.capacity, avg_curiosity, avg_actor_loss, avg_fwd_loss);
-
-        avg_curiosity
     }
 }
 

@@ -81,7 +81,7 @@ pub trait NeuralAgent: Send {
     type Actor: FuzzActor<State = Self::State, Action = Self::Action>;
 
     fn get_actor(&self) -> Self::Actor;
-    fn learn_from_batch(&mut self, trajectories: &[Trajectory<Self::State, Self::Action>]) -> f32;
+    fn learn_from_batch(&mut self, trajectories: &[Trajectory<Self::State, Self::Action>]);
 }
 
 pub struct FuzzEngine<
@@ -240,6 +240,8 @@ where
                     }
                 }
             }
+
+            self.agent.learn_from_batch(&rollouts);
 
             if iteration % self.config.log_interval == 0 {
                 let avg_reward = total_batch_reward / num_envs as f32;
