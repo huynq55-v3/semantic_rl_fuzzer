@@ -82,8 +82,6 @@ pub trait NeuralAgent: Send {
 
     fn get_actor(&self) -> Self::Actor;
     fn learn_from_batch(&mut self, trajectories: &[Trajectory<Self::State, Self::Action>]) -> f32;
-    fn reset_forward_net(&mut self);
-    fn get_curiosity_threshold(&self) -> f32;
 }
 
 pub struct FuzzEngine<
@@ -243,8 +241,6 @@ where
                 }
             }
 
-            let current_curiosity = self.agent.learn_from_batch(&rollouts);
-
             if iteration % self.config.log_interval == 0 {
                 let avg_reward = total_batch_reward / num_envs as f32;
                 let elapsed = start_time.elapsed().as_secs_f64();
@@ -254,10 +250,6 @@ where
                     "[Iter {} | Ep {}] Avg Reward: {:.2} | Crashes: {} | Speed: {:.0} steps/s",
                     iteration, total_episodes, avg_reward, crashes_found, fps
                 );
-
-                if current_curiosity < self.agent.get_curiosity_threshold() && crashes_found == 0 {
-                    self.agent.reset_forward_net();
-                }
 
                 on_log(iteration, &rollouts);
             }

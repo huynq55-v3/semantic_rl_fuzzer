@@ -1,6 +1,7 @@
 use crate::models::mlp::{MlpActor, MlpForward};
 use crate::models::transformer::{TransformerActor, TransformerForward};
 use crate::models::{ActorArchitecture, ForwardArchitecture, ModelArchitecture};
+use burn::backend::{Autodiff, Wgpu};
 use burn::module::AutodiffModule;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
@@ -8,6 +9,9 @@ use burn::tensor::backend::AutodiffBackend;
 use rand::distr::{weighted::WeightedIndex, Distribution, Uniform};
 use rand::rng;
 use rayon::prelude::*;
+
+// 🌟 Gắn cứng Backend là Wgpu (GPU mặc định)
+pub type FuzzBackend = Autodiff<Wgpu>;
 
 #[derive(Clone)]
 pub struct Transition {
@@ -68,32 +72,32 @@ pub trait ActionTranslator: Send + Sync + Clone {
     fn translate(&self, head_outputs: &[usize]) -> Self::TargetAction;
 }
 
-pub struct BurnAgent<B: AutodiffBackend, T: ActionTranslator, ActorO, FwdO> {
-    pub actor_net: ActorArchitecture<B>,
-    pub forward_net: ForwardArchitecture<B>,
+// 🌟 Loại bỏ Generic B
+pub struct BurnAgent<T: ActionTranslator, ActorO, FwdO> {
+    pub actor_net: ActorArchitecture<FuzzBackend>,
+    pub forward_net: ForwardArchitecture<FuzzBackend>,
     pub actor_opt: ActorO,
     pub fwd_opt: FwdO,
     pub translator: T,
     pub learning_rate: f64,
     pub d_model: usize,
-    pub device: B::Device,
+    pub device: <FuzzBackend as Backend>::Device,
     pub replay_buffer: ForwardReplayBuffer,
     pub intrinsic_weight: f32,
     pub entropy_coeff: f32,
     pub noise_floor: f32,
     pub batch_size: usize,
-    pub curiosity_threshold: f32,
 }
 
 #[derive(Clone)]
-pub struct BurnActor<B: Backend, T: ActionTranslator> {
-    pub actor_net: ActorArchitecture<B>,
+pub struct BurnActor<T: ActionTranslator> {
+    pub actor_net: ActorArchitecture<<FuzzBackend as AutodiffBackend>::InnerBackend>,
     pub translator: T,
-    pub device: B::Device,
+    pub device: <<FuzzBackend as AutodiffBackend>::InnerBackend as Backend>::Device,
     pub noise_floor: f32,
 }
 
-impl<B: Backend, T: ActionTranslator> crate::core::FuzzActor for BurnActor<B, T> {
+impl<T: ActionTranslator> crate::core::FuzzActor for BurnActor<T> {
     type State = Vec<f32>;
     type Action = T::TargetAction;
 
@@ -102,7 +106,7 @@ impl<B: Backend, T: ActionTranslator> crate::core::FuzzActor for BurnActor<B, T>
         state: &Self::State,
         masks: &[Vec<bool>],
     ) -> (Self::Action, Vec<usize>, f32) {
-        let state_tensor = Tensor::<B, 2>::from_data(
+        let state_tensor = Tensor::from_data(
             TensorData::new(state.clone(), [1, state.len()]),
             &self.device,
         );
@@ -116,7 +120,7 @@ impl<B: Backend, T: ActionTranslator> crate::core::FuzzActor for BurnActor<B, T>
         for (i, mut logits) in head_logits.into_iter().enumerate() {
             let head_size = logits.dims()[1];
             if !masks[i].is_empty() {
-                let mask_tensor = Tensor::<B, 2, Bool>::from_data(
+                let mask_tensor = Tensor::<_, 2, Bool>::from_data(
                     TensorData::new(masks[i].clone(), [1, head_size]),
                     &self.device,
                 );
@@ -175,7 +179,7 @@ impl<B: Backend, T: ActionTranslator> crate::core::FuzzActor for BurnActor<B, T>
             flattened_states.extend_from_slice(s);
         }
 
-        let state_tensor = Tensor::<B, 2>::from_data(
+        let state_tensor = Tensor::from_data(
             TensorData::new(flattened_states, [batch_size, state_dim]),
             &self.device,
         );
@@ -201,7 +205,7 @@ impl<B: Backend, T: ActionTranslator> crate::core::FuzzActor for BurnActor<B, T>
                 }
             }
 
-            let mask_tensor = Tensor::<B, 2, Bool>::from_data(
+            let mask_tensor = Tensor::<_, 2, Bool>::from_data(
                 TensorData::new(flat_mask, [batch_size, head_size]),
                 &self.device,
             );
@@ -261,38 +265,14 @@ impl<B: Backend, T: ActionTranslator> crate::core::FuzzActor for BurnActor<B, T>
     }
 }
 
-impl<B: AutodiffBackend, T: ActionTranslator, ActorO, FwdO> crate::core::NeuralAgent
-    for BurnAgent<B, T, ActorO, FwdO>
+impl<T: ActionTranslator, ActorO, FwdO> crate::core::NeuralAgent for BurnAgent<T, ActorO, FwdO>
 where
-    ActorO: Optimizer<ActorArchitecture<B>, B>,
-    FwdO: Optimizer<ForwardArchitecture<B>, B>,
+    ActorO: Optimizer<ActorArchitecture<FuzzBackend>, FuzzBackend>,
+    FwdO: Optimizer<ForwardArchitecture<FuzzBackend>, FuzzBackend>,
 {
     type State = Vec<f32>;
     type Action = T::TargetAction;
-    type Actor = BurnActor<B::InnerBackend, T>;
-
-    fn reset_forward_net(&mut self) {
-        let head_sizes = self.actor_net.head_sizes();
-        let input_size = self
-            .replay_buffer
-            .memory
-            .first()
-            .map_or(0, |m| m.state.len());
-        if input_size == 0 {
-            return;
-        }
-
-        let total_action_dims: usize = head_sizes.iter().sum();
-        self.forward_net = self.forward_net.reset_architecture(
-            &self.device,
-            input_size,
-            total_action_dims,
-            self.d_model,
-        );
-        self.replay_buffer.memory.clear();
-        self.replay_buffer.ptr = 0;
-        println!("[System] Oracle Network reset - Environment novelty restored.");
-    }
+    type Actor = BurnActor<T>;
 
     fn get_actor(&self) -> Self::Actor {
         BurnActor {
@@ -301,10 +281,6 @@ where
             device: self.device.clone(),
             noise_floor: self.noise_floor,
         }
-    }
-
-    fn get_curiosity_threshold(&self) -> f32 {
-        self.curiosity_threshold
     }
 
     fn learn_from_batch(
@@ -359,15 +335,15 @@ where
             for _ in 0..fwd_epochs {
                 let (b_s, b_a, b_sn) = self.replay_buffer.sample(fwd_batch_size);
 
-                let s_tens = Tensor::<B, 2>::from_data(
+                let s_tens = Tensor::<FuzzBackend, 2>::from_data(
                     TensorData::new(b_s, [fwd_batch_size, state_dim]),
                     &self.device,
                 );
-                let a_tens = Tensor::<B, 2>::from_data(
+                let a_tens = Tensor::<FuzzBackend, 2>::from_data(
                     TensorData::new(b_a, [fwd_batch_size, total_action_dims]),
                     &self.device,
                 );
-                let sn_tens = Tensor::<B, 2>::from_data(
+                let sn_tens = Tensor::<FuzzBackend, 2>::from_data(
                     TensorData::new(b_sn, [fwd_batch_size, state_dim]),
                     &self.device,
                 );
@@ -403,19 +379,19 @@ where
             let mb_a_f32 = all_ai_f32[start * total_action_dims..end * total_action_dims].to_vec();
             let mb_rew = all_rewards[start..end].to_vec();
 
-            let s_tens = Tensor::<B, 2>::from_data(
+            let s_tens = Tensor::<FuzzBackend, 2>::from_data(
                 TensorData::new(mb_s, [current_batch_size, state_dim]),
                 &self.device,
             );
-            let sn_tens = Tensor::<B, 2>::from_data(
+            let sn_tens = Tensor::<FuzzBackend, 2>::from_data(
                 TensorData::new(mb_sn, [current_batch_size, state_dim]),
                 &self.device,
             );
-            let a_tens = Tensor::<B, 2>::from_data(
+            let a_tens = Tensor::<FuzzBackend, 2>::from_data(
                 TensorData::new(mb_a_f32, [current_batch_size, total_action_dims]),
                 &self.device,
             );
-            let ext_rew_tens = Tensor::<B, 1>::from_data(
+            let ext_rew_tens = Tensor::<FuzzBackend, 1>::from_data(
                 TensorData::new(mb_rew, [current_batch_size]),
                 &self.device,
             );
@@ -436,7 +412,7 @@ where
             let total_rewards = ext_rew_tens.add(int_rewards.mul_scalar(intrinsic_weight as f64));
 
             let all_head_logits = self.actor_net.forward_with_floor(s_tens, self.noise_floor);
-            let mut actor_loss_sum = Tensor::<B, 1>::from_data([0.0], &self.device);
+            let mut actor_loss_sum = Tensor::<FuzzBackend, 1>::from_data([0.0], &self.device);
 
             for (h, logits) in all_head_logits.into_iter().enumerate() {
                 let probs = burn::tensor::activation::softmax(logits.clone(), 1).clamp_min(1e-8);
@@ -451,7 +427,7 @@ where
                     .copied()
                     .collect();
 
-                let index_tensor = Tensor::<B, 2, burn::tensor::Int>::from_data(
+                let index_tensor = Tensor::<FuzzBackend, 2, burn::tensor::Int>::from_data(
                     TensorData::new(mb_a_i64, [current_batch_size, 1]),
                     &self.device,
                 );
@@ -484,8 +460,8 @@ where
     }
 }
 
-pub fn create_agent<B: AutodiffBackend, T: ActionTranslator>(
-    device: &B::Device,
+// 🌟 API Cực Kỳ Tối Giản
+pub fn create_agent<T: ActionTranslator>(
     arch: ModelArchitecture,
     input_size: usize,
     d_model: usize,
@@ -495,21 +471,22 @@ pub fn create_agent<B: AutodiffBackend, T: ActionTranslator>(
     intrinsic_weight: f32,
     entropy_coeff: f32,
     noise_floor: f32,
-    curiosity_threshold: f32,
     batch_size: usize,
     buffer_capacity: usize,
 ) -> BurnAgent<
-    B,
     T,
-    impl Optimizer<ActorArchitecture<B>, B>,
-    impl Optimizer<ForwardArchitecture<B>, B>,
+    impl Optimizer<ActorArchitecture<FuzzBackend>, FuzzBackend>,
+    impl Optimizer<ForwardArchitecture<FuzzBackend>, FuzzBackend>,
 > {
+    // Tự động khởi tạo Device bên trong
+    let device = <FuzzBackend as Backend>::Device::default();
+
     let actor_net = match arch {
         ModelArchitecture::Mlp => {
-            ActorArchitecture::Mlp(MlpActor::new(device, input_size, d_model, head_sizes))
+            ActorArchitecture::Mlp(MlpActor::new(&device, input_size, d_model, head_sizes))
         }
         ModelArchitecture::Transformer => ActorArchitecture::Transformer(TransformerActor::new(
-            device, input_size, d_model, head_sizes,
+            &device, input_size, d_model, head_sizes,
         )),
     };
 
@@ -517,13 +494,13 @@ pub fn create_agent<B: AutodiffBackend, T: ActionTranslator>(
 
     let forward_net = match arch {
         ModelArchitecture::Mlp => ForwardArchitecture::Mlp(MlpForward::new(
-            device,
+            &device,
             input_size,
             total_action_dims,
             d_model,
         )),
         ModelArchitecture::Transformer => ForwardArchitecture::Transformer(
-            TransformerForward::new(device, input_size, total_action_dims, d_model),
+            TransformerForward::new(&device, input_size, total_action_dims, d_model),
         ),
     };
 
@@ -535,12 +512,11 @@ pub fn create_agent<B: AutodiffBackend, T: ActionTranslator>(
         translator,
         learning_rate,
         d_model,
-        device: device.clone(),
+        device,
         replay_buffer: ForwardReplayBuffer::new(buffer_capacity),
         intrinsic_weight,
         entropy_coeff,
         noise_floor,
         batch_size,
-        curiosity_threshold,
     }
 }
