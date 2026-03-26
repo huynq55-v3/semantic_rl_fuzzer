@@ -94,11 +94,18 @@ pub trait TruthOracle<E: FuzzEnvironment>: Send + Sync {
 pub trait FuzzActor: Send + Clone {
     type State;
     type Action;
+
     fn choose_action(
         &self,
         state: &Self::State,
         masks: &[Vec<bool>],
     ) -> (Self::Action, Vec<usize>, f32);
+
+    fn choose_batch_action(
+        &self,
+        states: &[Self::State],
+        masks_batch: &[Vec<Vec<bool>>],
+    ) -> Vec<(Self::Action, Vec<usize>, f32)>;
 }
 
 /// The learner side: owns the Autodiff graph, produces lightweight Actors.
@@ -158,119 +165,151 @@ where
         for iteration in 1..=self.config.total_iterations {
             let start_time = Instant::now();
 
-            // ==========================================
-            // EXTRACT ACTOR (thread-safe, no Autodiff)
-            // Pre-clone on main thread to avoid Sync requirement
-            // ==========================================
-            let actor_template = self.agent.get_actor();
+            // Extract template actor (thread-safe, no Autodiff)
+            let actor = self.agent.get_actor();
             let oracle_ref = &self.oracle;
+            let num_envs = self.config.num_envs;
             let max_steps = self.config.max_steps_per_episode;
 
-            // Pre-clone actors + envs on the main thread (single-threaded, no Sync needed)
-            let work_items: Vec<_> = (0..self.config.num_envs)
-                .map(|_| (actor_template.clone(), self.base_env.clone()))
-                .collect();
+            // 1. Khởi tạo lô Environment
+            let mut envs: Vec<E> = vec![self.base_env.clone(); num_envs];
+            for env in envs.iter_mut() {
+                env.reset();
+            }
 
-            let mut rollouts: Vec<Trajectory<E::State, E::Action>> = work_items
-                .into_par_iter()
-                .map(|(actor, mut local_env)| {
-                    local_env.reset();
+            // 2. Khởi tạo lô Trajectory ghi nhật ký
+            let mut rollouts: Vec<Trajectory<E::State, E::Action>> = vec![
+                Trajectory {
+                    states: Vec::with_capacity(max_steps * 2),
+                    actions: Vec::with_capacity(max_steps),
+                    action_indices: Vec::with_capacity(max_steps),
+                    log_probs: Vec::with_capacity(max_steps),
+                    reward: 0.0,
+                    is_interesting: false,
+                };
+                num_envs
+            ];
 
-                    let mut traj = Trajectory {
-                        states: Vec::with_capacity(max_steps),
-                        actions: Vec::with_capacity(max_steps),
-                        action_indices: Vec::with_capacity(max_steps),
-                        log_probs: Vec::with_capacity(max_steps),
-                        reward: 0.0,
-                        is_interesting: false,
-                    };
+            let mut active_mask = vec![true; num_envs];
 
-                    for _ in 0..max_steps {
-                        let state = local_env.get_state();
-                        let masks = local_env.get_action_mask();
+            // ==========================================
+            // 🌟 VÒNG LẶP ĐỒNG BỘ: Tất cả Environment tiến 1 bước cùng lúc
+            // ==========================================
+            for _step in 0..max_steps {
+                // Bước 1: Thu thập State và Mask cực nhanh bằng Rayon
+                let current_states: Vec<E::State> =
+                    envs.par_iter().map(|e| e.get_state()).collect();
 
-                        // Use ACTOR (owned, not shared) for thread-safe inference
-                        let (action, indices, log_prob) = actor.choose_action(&state, &masks);
-                        let result = local_env.step(&action);
+                let current_masks: Vec<Vec<Vec<bool>>> =
+                    envs.par_iter().map(|e| e.get_action_mask()).collect();
 
-                        traj.states.push(state.clone());
-                        traj.actions.push(action.clone());
-                        traj.action_indices.push(indices);
-                        traj.log_probs.push(log_prob);
+                // Bước 2: BATCH INFERENCE - Gửi toàn bộ lên GPU trong 1 lệnh duy nhất!
+                let batch_results = actor.choose_batch_action(&current_states, &current_masks);
 
-                        // Push next_state so ICM has (S_t, S_{t+1}) pairs
-                        traj.states.push(result.next_state);
+                // Bước 3: Áp dụng Action vào các Environment song song trên CPU
+                let step_results: Vec<_> = envs
+                    .par_iter_mut()
+                    .zip(batch_results.into_par_iter())
+                    .zip(active_mask.par_iter())
+                    .map(|((env, (action, indices, log_prob)), &is_active)| {
+                        if !is_active {
+                            return None;
+                        }
 
-                        let status = oracle_ref.judge(&mut local_env, result.is_invalid);
+                        let state_before = env.get_state();
+                        let result = env.step(&action);
+                        let status = oracle_ref.judge(env, result.is_invalid);
+
+                        Some((
+                            state_before,
+                            action,
+                            indices,
+                            log_prob,
+                            result.next_state,
+                            status,
+                        ))
+                    })
+                    .collect();
+
+                // Bước 4: Cập nhật Trajectories và kiểm tra điều kiện dừng
+                let mut any_active = false;
+                for (i, res) in step_results.into_iter().enumerate() {
+                    if let Some((s_before, act, idx, lp, s_next, status)) = res {
+                        let traj = &mut rollouts[i];
+
+                        traj.states.push(s_before);
+                        traj.actions.push(act);
+                        traj.action_indices.push(idx);
+                        traj.log_probs.push(lp);
+                        traj.states.push(s_next);
 
                         match status {
                             OracleStatus::Violated => {
                                 traj.is_interesting = true;
-                                break;
+                                active_mask[i] = false;
                             }
-                            OracleStatus::Hold { reward } => traj.reward += reward,
+                            OracleStatus::Hold { reward } => {
+                                traj.reward += reward;
+                                any_active = true;
+                            }
                             OracleStatus::Invalid => {
                                 traj.reward -= 1.0;
-                                break;
+                                active_mask[i] = false;
                             }
                         }
                     }
+                }
 
-                    if traj.reward > 0.0 {
-                        traj.is_interesting = true;
-                    }
-                    traj
-                })
-                .collect();
+                // Nếu tất cả môi trường đều sập/hoàn thành, kết thúc sớm vòng lặp steps
+                if !any_active {
+                    break;
+                }
+            }
 
-            global_episodes += self.config.num_envs;
+            global_episodes += num_envs;
 
             // ==========================================
             // XỬ LÝ KẾT QUẢ & TRAIN
             // ==========================================
             let mut total_batch_reward = 0.0;
             let mut crashes_found = 0;
+            let mut total_steps_taken = 0;
 
-            for traj in rollouts.iter() {
+            for (i, traj) in rollouts.iter_mut().enumerate() {
+                total_steps_taken += traj.actions.len();
                 total_batch_reward += traj.reward;
 
+                if traj.reward > 0.0 {
+                    traj.is_interesting = true;
+                }
+
                 if traj.is_interesting {
-                    if traj.reward == 0.0 && traj.states.is_empty() { // Example crash detection
-                         // Logic defined by your environment
+                    if !traj.reward.is_nan() {
+                        self.corpus.interesting_seeds.push(traj.clone());
                     }
-                    // For now, if Violated was reached or reward > 0
-                    if traj.reward.is_nan() {
-                        continue;
-                    } // Safety
 
-                    // If it's a crash (Violated), we likely want to save it
-                    // The Trajectory doesn't explicitly store the OracleStatus it ended with,
-                    // but we can infer or add it. Let's keep it simple.
-                    self.corpus.interesting_seeds.push(traj.clone());
+                    // Tái phát hiện crash để xuất Artifacts
+                    if traj.reward <= -1.0 || traj.states.is_empty() {
+                        crashes_found += 1;
+                        let filename = format!("artifacts/bug_iter_{}_env_{}.txt", iteration, i);
+                        let content = format!("Action sequence:\n{:#?}", traj.actions);
+                        let _ = artifact_tx.send((filename, content));
+                    }
                 }
             }
 
-            // Re-detect crashes for artifact saving
-            for (i, traj) in rollouts.iter().enumerate() {
-                if traj.is_interesting && traj.reward <= -1.0 {
-                    // Simplified crash/invalid indicator
-                    crashes_found += 1;
-                    let filename = format!("artifacts/bug_iter_{}_env_{}.txt", iteration, i);
-                    let content = format!("Action sequence:\n{:#?}", traj.actions);
-                    let _ = artifact_tx.send((filename, content));
-                }
-            }
-
+            // Gửi cả lô cho Actor học
             let current_curiosity = self.agent.learn_from_batch(&rollouts);
 
             // ==========================================
             // LOGGING & CALLBACK
             // ==========================================
             if iteration % self.config.log_interval == 0 {
-                let avg_reward = total_batch_reward / self.config.num_envs as f32;
+                let avg_reward = total_batch_reward / num_envs as f32;
                 let elapsed = start_time.elapsed().as_secs_f64();
-                let fps =
-                    (self.config.num_envs * self.config.max_steps_per_episode) as f64 / elapsed;
+
+                // Tính toán FPS dựa trên số bước thực tế đã chạy
+                let fps = total_steps_taken as f64 / elapsed;
 
                 println!(
                     "📊 [Iter {} | Ep {}] Avg Reward: {:.2} | Crashes: {} | Speed: {:.0} steps/s",
@@ -281,11 +320,8 @@ where
                     self.agent.reset_forward_net();
                 }
 
-                // Fire callback so consuming code can analyze the batch
                 on_log(iteration, &rollouts);
             }
-
-            rollouts.clear();
         }
 
         drop(artifact_tx);
@@ -304,6 +340,7 @@ pub mod burn_helpers {
     use burn::tensor::backend::AutodiffBackend;
     use rand::distr::{weighted::WeightedIndex, Distribution, Uniform};
     use rand::rng;
+    use rayon::prelude::*;
 
     // ==========================================
     // TRÍ NHỚ DÀI HẠN (Replay Buffer) - Giữ nguyên
@@ -596,6 +633,110 @@ pub mod burn_helpers {
                 selected_indices,
                 total_log_prob,
             )
+        }
+
+        fn choose_batch_action(
+            &self,
+            states: &[Self::State],
+            masks_batch: &[Vec<Vec<bool>>],
+        ) -> Vec<(Self::Action, Vec<usize>, f32)> {
+            let batch_size = states.len();
+            if batch_size == 0 {
+                return Vec::new();
+            }
+
+            let state_dim = states[0].len();
+
+            // 1. Gom tất cả state thành 1 vector phẳng duy nhất [batch_size * state_dim]
+            let mut flattened_states = Vec::with_capacity(batch_size * state_dim);
+            for state in states {
+                flattened_states.extend_from_slice(state);
+            }
+
+            // 2. Ép vào 1 Tensor 2D khổng lồ để đẩy lên GPU 1 lần
+            let state_tensor = Tensor::<B, 2>::from_data(
+                TensorData::new(flattened_states, [batch_size, state_dim]),
+                &self.device,
+            );
+
+            // 3. Inference qua Neural Net 1 lần duy nhất cho toàn bộ Environment!
+            let all_head_logits = self
+                .actor_net
+                .forward_with_floor(state_tensor, self.noise_floor);
+            let num_heads = all_head_logits.len();
+
+            // Kéo toàn bộ probability của mọi heads về CPU một lần để phân giải
+            let mut heads_probs_vecs: Vec<Vec<f32>> = Vec::with_capacity(num_heads);
+            let mut heads_sizes = Vec::with_capacity(num_heads);
+
+            for (h, logits) in all_head_logits.into_iter().enumerate() {
+                let head_size = logits.dims()[1];
+                heads_sizes.push(head_size);
+
+                // Áp dụng Mask cho nguyên cả lô
+                let mut flat_mask = Vec::with_capacity(batch_size * head_size);
+                for b in 0..batch_size {
+                    if masks_batch[b][h].is_empty() {
+                        flat_mask.extend(std::iter::repeat(true).take(head_size));
+                    } else {
+                        flat_mask.extend(masks_batch[b][h].iter().copied());
+                    }
+                }
+
+                let mask_tensor = Tensor::<B, 2, Bool>::from_data(
+                    TensorData::new(flat_mask, [batch_size, head_size]),
+                    &self.device,
+                );
+
+                let masked_logits = logits.mask_fill(mask_tensor.bool_not(), -1e9);
+                let probs = burn::tensor::activation::softmax(masked_logits, 1);
+
+                // Tải kết quả về RAM (CPU) một lần
+                heads_probs_vecs.push(probs.into_data().to_vec::<f32>().unwrap());
+            }
+
+            let translator = &self.translator;
+
+            // 4. Sample Action song song trên CPU cực mượt với Rayon
+            let results: Vec<_> = (0..batch_size)
+                .into_par_iter()
+                .map(|b| {
+                    let mut selected_indices = Vec::with_capacity(num_heads);
+                    let mut total_log_prob = 0.0;
+                    let mut rng = rng();
+
+                    for h in 0..num_heads {
+                        let head_size = heads_sizes[h];
+                        let start_idx = b * head_size;
+                        let end_idx = start_idx + head_size;
+                        let head_probs = &heads_probs_vecs[h][start_idx..end_idx];
+
+                        // Sample sử dụng WeightedIndex
+                        let dist_result = WeightedIndex::new(head_probs);
+                        let chosen_index = match dist_result {
+                            Ok(dist) => dist.sample(&mut rng),
+                            Err(_) => {
+                                // Fallback nếu xác suất bằng 0 hết (hiếm khi xảy ra)
+                                if !masks_batch[b][h].is_empty() {
+                                    masks_batch[b][h].iter().position(|&v| v).unwrap_or(0)
+                                } else {
+                                    0
+                                }
+                            }
+                        };
+
+                        selected_indices.push(chosen_index);
+                        let prob = head_probs[chosen_index].max(1e-8); // Tránh ln(0)
+                        total_log_prob += prob.ln();
+                    }
+
+                    // 🌟 SỬA Ở ĐÂY: Dùng biến `translator` thay vì `self.translator`
+                    let action = translator.translate(&selected_indices);
+                    (action, selected_indices, total_log_prob)
+                })
+                .collect();
+
+            results
         }
     }
 
