@@ -27,6 +27,7 @@ pub struct Trajectory<S, A> {
     pub states: Vec<S>,
     pub actions: Vec<A>,
     pub action_indices: Vec<Vec<usize>>,
+    pub masks: Vec<Vec<Vec<bool>>>,     // 🌟 BỔ SUNG: Lưu lại Mask của từng Step
     pub log_probs: Vec<f32>,
     pub reward: f32,
     pub is_interesting: bool,
@@ -137,6 +138,7 @@ where
                     states: Vec::with_capacity(max_steps * 2),
                     actions: Vec::with_capacity(max_steps),
                     action_indices: Vec::with_capacity(max_steps),
+                    masks: Vec::with_capacity(max_steps), // 🌟 Bổ sung
                     log_probs: Vec::with_capacity(max_steps),
                     reward: 0.0,
                     is_interesting: false,
@@ -157,10 +159,11 @@ where
                 let step_results: Vec<_> = envs
                     .par_iter_mut()
                     .zip(current_states.into_par_iter())
+                    .zip(current_masks.clone().into_par_iter()) // 🌟 Bổ sung zip masks
                     .zip(batch_results.into_par_iter())
                     .zip(active_mask.par_iter())
                     .map(
-                        |(((env, state_before), (action, indices, log_prob)), &is_active)| {
+                        |((((env, state_before), mask_before), (action, indices, log_prob)), &is_active)| {
                             if !is_active {
                                 return None;
                             }
@@ -172,6 +175,7 @@ where
                                 state_before,
                                 action,
                                 indices,
+                                mask_before, // 🌟 Trả về mask
                                 log_prob,
                                 result.next_state,
                                 status,
@@ -182,12 +186,13 @@ where
 
                 let mut any_active = false;
                 for (i, res) in step_results.into_iter().enumerate() {
-                    if let Some((s_before, act, idx, lp, s_next, status)) = res {
+                    if let Some((s_before, act, idx, mask, lp, s_next, status)) = res { // Nhận mask
                         let traj = &mut rollouts[i];
 
                         traj.states.push(s_before);
                         traj.actions.push(act);
                         traj.action_indices.push(idx);
+                        traj.masks.push(mask); // 🌟 Lưu mask vào traj
                         traj.log_probs.push(lp);
                         traj.states.push(s_next);
 
@@ -241,6 +246,7 @@ where
                 }
             }
 
+            // 🌟 Gọi hàm học
             self.agent.learn_from_batch(&rollouts);
 
             if iteration % self.config.log_interval == 0 {
@@ -248,8 +254,9 @@ where
                 let elapsed = start_time.elapsed().as_secs_f64();
                 let fps = total_steps_taken as f64 / elapsed;
 
+                // 🌟 KHÔI PHỤC LOG
                 println!(
-                    "[Iter {} | Ep {}] Avg Reward: {:.2} | Crashes: {} | Speed: {:.0} steps/s",
+                    "📊 [Iter {} | Ep {}] Avg Reward: {:.2} | Crashes: {} | Speed: {:.0} steps/s",
                     iteration, total_episodes, avg_reward, crashes_found, fps
                 );
 

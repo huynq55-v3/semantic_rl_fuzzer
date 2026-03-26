@@ -296,6 +296,9 @@ where
         let mut all_ai_f32 = Vec::new();
         let mut all_rewards = Vec::new();
 
+        // 🌟 BỔ SUNG: Chứa mask phẳng (flattened) của từng head
+        let mut all_masks_by_head: Vec<Vec<bool>> = vec![Vec::new(); head_sizes.len()];
+
         for t in trajectories.iter().filter(|t| !t.action_indices.is_empty()) {
             for i in 0..t.action_indices.len() {
                 let s_t = &t.states[2 * i];
@@ -304,6 +307,16 @@ where
                 all_s.extend_from_slice(s_t);
                 all_sn.extend_from_slice(s_n);
                 all_ai_i64.extend(t.action_indices[i].iter().map(|&idx| idx as i64));
+
+                // 🌟 BỔ SUNG: Kéo dài Mask cho từng Head
+                for h in 0..head_sizes.len() {
+                    if t.masks[i][h].is_empty() {
+                        // Nếu rỗng nghĩa là không mask (tất cả đều true)
+                        all_masks_by_head[h].extend(std::iter::repeat(true).take(head_sizes[h]));
+                    } else {
+                        all_masks_by_head[h].extend(&t.masks[i][h]);
+                    }
+                }
 
                 let mut one_hot = vec![0.0f32; total_action_dims];
                 let mut offset = 0;
@@ -414,9 +427,22 @@ where
             let all_head_logits = self.actor_net.forward_with_floor(s_tens, self.noise_floor);
             let mut actor_loss_sum = Tensor::<FuzzBackend, 1>::from_data([0.0], &self.device);
 
-            for (h, logits) in all_head_logits.into_iter().enumerate() {
+            for (h, mut logits) in all_head_logits.into_iter().enumerate() {
+                let h_size = head_sizes[h];
+
+                // 🌟 BƯỚC SỬA LỖI CHÍ MẠNG: ĐEO RỌ MÕM (MASK) LÚC HỌC
+                let mb_mask = &all_masks_by_head[h][start * h_size..end * h_size];
+                let mask_tensor = Tensor::<FuzzBackend, 2, Bool>::from_data(
+                    TensorData::new(mb_mask.to_vec(), [current_batch_size, h_size]),
+                    &self.device,
+                );
+                // Biến Invalid actions thành -âm vô cực
+                logits = logits.mask_fill(mask_tensor.bool_not(), -1e9);
+
+                // 🌟 TÍNH XÁC SUẤT SAU KHI ĐÃ MASK (Đồng nhất hoàn toàn với lúc inference)
                 let probs = burn::tensor::activation::softmax(logits.clone(), 1).clamp_min(1e-8);
                 let log_probs_all = burn::tensor::activation::log_softmax(logits, 1);
+
                 let entropy = probs.clone().mul(log_probs_all).sum_dim(1).neg().mean();
 
                 let mb_a_i64: Vec<i64> = all_ai_i64
@@ -453,8 +479,16 @@ where
         avg_actor_loss /= num_batches as f32;
         avg_curiosity /= num_batches as f32;
 
-        println!("[Batch] {} steps | Replay Mem: {}/{} | Int_μ: {:.4} | Act_Loss: {:.4} | Fwd_Loss: {:.4}", 
-            total_steps, self.replay_buffer.memory.len(), self.replay_buffer.capacity, avg_curiosity, avg_actor_loss, avg_fwd_loss);
+        // 🌟 KHÔI PHỤC LOG EMONJI TRONG AGENT
+        println!(
+            "🔥 [Batch] {} steps | Replay Mem: {}/{} | Int_μ: {:.4} | Act_Loss: {:.4} | Fwd_Loss: {:.4}",
+            total_steps,
+            self.replay_buffer.memory.len(),
+            self.replay_buffer.capacity,
+            avg_curiosity,
+            avg_actor_loss,
+            avg_fwd_loss
+        );
     }
 }
 
