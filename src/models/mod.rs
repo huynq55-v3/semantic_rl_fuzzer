@@ -26,34 +26,4 @@ impl<B: Backend> ActorArchitecture<B> {
     }
 }
 
-#[derive(Module, Debug)]
-pub enum ForwardArchitecture<B: Backend> {
-    Mlp(mlp::MlpForward<B>),
-}
-
-impl<B: Backend> ForwardArchitecture<B> {
-    pub fn forward_step(&self, state: Tensor<B, 2>, action_indices: Tensor<B, 2>) -> Tensor<B, 2> {
-        match self {
-            Self::Mlp(m) => m.forward(state, action_indices),
-        }
-    }
-
-    pub fn reset_architecture(
-        &self,
-        device: &B::Device,
-        input_size: usize,
-        total_action_dims: usize,
-        d_model: usize,
-    ) -> Self {
-        match self {
-            Self::Mlp(_) => Self::Mlp(mlp::MlpForward::new(
-                device,
-                input_size,
-                total_action_dims,
-                d_model,
-            )),
-        }
-    }
-}
-
-const LOGIT_NOISE_MULTIPLIER: f64 = 40.0;
+pub const LOGIT_NOISE_MULTIPLIER: f64 = 40.0;

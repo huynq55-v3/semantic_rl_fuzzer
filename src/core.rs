@@ -1,6 +1,7 @@
 use rayon::prelude::*;
+use std::collections::HashSet;
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::Instant; // 🌟 Thêm thư viện
 
 #[derive(Debug, Clone)]
 pub struct FuzzConfig {
@@ -27,7 +28,7 @@ pub struct Trajectory<S, A> {
     pub states: Vec<S>,
     pub actions: Vec<A>,
     pub action_indices: Vec<Vec<usize>>,
-    pub masks: Vec<Vec<Vec<bool>>>,     // 🌟 BỔ SUNG: Lưu lại Mask của từng Step
+    pub masks: Vec<Vec<Vec<bool>>>,
     pub log_probs: Vec<f32>,
     pub reward: f32,
     pub is_interesting: bool,
@@ -35,24 +36,27 @@ pub struct Trajectory<S, A> {
 
 pub struct FuzzCorpus<S, A> {
     pub interesting_seeds: Vec<Trajectory<S, A>>,
+    pub seen_states: HashSet<u64>, // 🌟 BẢN ĐỒ ĐỘ PHỦ TRẠNG THÁI!
 }
 
 impl<S, A> FuzzCorpus<S, A> {
     pub fn new() -> Self {
         Self {
             interesting_seeds: Vec::new(),
+            seen_states: HashSet::new(),
         }
     }
 }
 
 pub trait FuzzEnvironment: Clone + Send + Sync {
-    type State: Send + Sync;
+    type State: Send + Sync + Clone;
     type Action: Send + Sync;
 
     fn get_state(&self) -> Self::State;
     fn get_action_mask(&self) -> Vec<Vec<bool>>;
     fn step(&mut self, action: &Self::Action) -> StepResult<Self::State>;
     fn reset(&mut self);
+    fn hash_state(state: &Self::State) -> u64; // 🌟 Bắt buộc cấu hình phải biết cách băm State
 }
 
 pub trait TruthOracle<E: FuzzEnvironment>: Send + Sync {
@@ -135,10 +139,10 @@ where
 
             let mut rollouts: Vec<Trajectory<E::State, E::Action>> = vec![
                 Trajectory {
-                    states: Vec::with_capacity(max_steps * 2),
+                    states: Vec::with_capacity(max_steps + 1), // N actions -> N+1 states
                     actions: Vec::with_capacity(max_steps),
                     action_indices: Vec::with_capacity(max_steps),
-                    masks: Vec::with_capacity(max_steps), // 🌟 Bổ sung
+                    masks: Vec::with_capacity(max_steps),
                     log_probs: Vec::with_capacity(max_steps),
                     reward: 0.0,
                     is_interesting: false,
@@ -159,11 +163,14 @@ where
                 let step_results: Vec<_> = envs
                     .par_iter_mut()
                     .zip(current_states.into_par_iter())
-                    .zip(current_masks.clone().into_par_iter()) // 🌟 Bổ sung zip masks
+                    .zip(current_masks.into_par_iter())
                     .zip(batch_results.into_par_iter())
                     .zip(active_mask.par_iter())
                     .map(
-                        |((((env, state_before), mask_before), (action, indices, log_prob)), &is_active)| {
+                        |(
+                            (((env, state_before), mask_before), (action, indices, log_prob)),
+                            &is_active,
+                        )| {
                             if !is_active {
                                 return None;
                             }
@@ -175,7 +182,7 @@ where
                                 state_before,
                                 action,
                                 indices,
-                                mask_before, // 🌟 Trả về mask
+                                mask_before,
                                 log_prob,
                                 result.next_state,
                                 status,
@@ -186,15 +193,25 @@ where
 
                 let mut any_active = false;
                 for (i, res) in step_results.into_iter().enumerate() {
-                    if let Some((s_before, act, idx, mask, lp, s_next, status)) = res { // Nhận mask
+                    if let Some((s_before, act, idx, mask, lp, s_next, status)) = res {
                         let traj = &mut rollouts[i];
 
-                        traj.states.push(s_before);
+                        if traj.states.is_empty() {
+                            traj.states.push(s_before);
+                        }
+
                         traj.actions.push(act);
                         traj.action_indices.push(idx);
-                        traj.masks.push(mask); // 🌟 Lưu mask vào traj
+                        traj.masks.push(mask);
                         traj.log_probs.push(lp);
-                        traj.states.push(s_next);
+                        traj.states.push(s_next.clone());
+
+                        // 🌟 TÌM KIẾM ĐỘ PHỦ NGAY TẠI ĐÂY!
+                        let hash_val = E::hash_state(&s_next);
+                        if self.corpus.seen_states.insert(hash_val) {
+                            traj.reward += 1.0; // THƯỞNG COVERAGE MỚI!
+                            traj.is_interesting = true;
+                        }
 
                         match status {
                             OracleStatus::Violated => {
@@ -219,7 +236,6 @@ where
             }
 
             total_episodes += num_envs;
-
             let mut total_batch_reward = 0.0;
             let mut crashes_found = 0;
             let mut total_steps_taken = 0;
@@ -246,7 +262,6 @@ where
                 }
             }
 
-            // 🌟 Gọi hàm học
             self.agent.learn_from_batch(&rollouts);
 
             if iteration % self.config.log_interval == 0 {
@@ -254,10 +269,9 @@ where
                 let elapsed = start_time.elapsed().as_secs_f64();
                 let fps = total_steps_taken as f64 / elapsed;
 
-                // 🌟 KHÔI PHỤC LOG
                 println!(
-                    "📊 [Iter {} | Ep {}] Avg Reward: {:.2} | Crashes: {} | Speed: {:.0} steps/s",
-                    iteration, total_episodes, avg_reward, crashes_found, fps
+                    "📊 [Iter {} | Ep {}] Avg Reward: {:.2} | Crashes: {} | State Coverage: {} | Speed: {:.0} steps/s",
+                    iteration, total_episodes, avg_reward, crashes_found, self.corpus.seen_states.len(), fps
                 );
 
                 on_log(iteration, &rollouts);

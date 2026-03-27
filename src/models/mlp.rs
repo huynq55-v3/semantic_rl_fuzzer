@@ -59,30 +59,3 @@ impl<B: Backend> MlpActor<B> {
             .collect()
     }
 }
-
-#[derive(Module, Debug)]
-pub struct MlpForward<B: Backend> {
-    fc_1: Linear<B>,
-    fc_2: Linear<B>,
-    out: Linear<B>,
-    relu: Relu,
-}
-
-impl<B: Backend> MlpForward<B> {
-    pub fn new(device: &B::Device, state_dim: usize, num_heads: usize, d_model: usize) -> Self {
-        let input_dim = state_dim + num_heads;
-        Self {
-            fc_1: LinearConfig::new(input_dim, d_model * 2).init(device),
-            fc_2: LinearConfig::new(d_model * 2, d_model * 2).init(device),
-            out: LinearConfig::new(d_model * 2, state_dim).init(device),
-            relu: Relu::new(),
-        }
-    }
-
-    pub fn forward(&self, state: Tensor<B, 2>, action_indices: Tensor<B, 2>) -> Tensor<B, 2> {
-        let x = Tensor::cat(vec![state, action_indices], 1);
-        let x = self.relu.forward(self.fc_1.forward(x));
-        let x = self.relu.forward(self.fc_2.forward(x));
-        self.out.forward(x)
-    }
-}
