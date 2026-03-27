@@ -34,6 +34,7 @@ pub struct Trajectory<S, A> {
     pub log_probs: Vec<f32>,
     pub reward: f32,
     pub is_interesting: bool,
+    pub is_crash: bool,
 }
 
 // 🌟 BẢN FIX VÔ THƯỢNG: Lưu trữ toàn bộ "linh hồn" của ván game
@@ -160,6 +161,7 @@ where
                     log_probs: Vec::with_capacity(max_steps),
                     reward: 0.0,
                     is_interesting: false,
+                    is_crash: false,
                 };
                 num_envs
             ];
@@ -274,6 +276,7 @@ where
                         match status {
                             OracleStatus::Violated => {
                                 traj.is_interesting = true;
+                                traj.is_crash = true;
                                 active_mask[i] = false;
                             }
                             OracleStatus::Hold { reward } => {
