@@ -1,5 +1,4 @@
 use crate::models::mlp::{MlpActor, MlpForward};
-use crate::models::transformer::{TransformerActor, TransformerForward};
 use crate::models::{ActorArchitecture, ForwardArchitecture, ModelArchitecture};
 use burn::backend::{Autodiff, Wgpu};
 use burn::module::AutodiffModule;
@@ -425,6 +424,9 @@ where
             let intrinsic_weight = self.intrinsic_weight * scale_factor;
             let total_rewards = ext_rew_tens.add(int_rewards.mul_scalar(intrinsic_weight as f64));
 
+            let mean_reward = total_rewards.clone().mean();
+            let advantage = total_rewards.sub(mean_reward).detach();
+
             let all_head_logits = self.actor_net.forward_with_floor(s_tens, self.noise_floor);
             let mut actor_loss_sum = Tensor::<FuzzBackend, 1>::from_data([0.0], &self.device);
 
@@ -438,13 +440,15 @@ where
                     &self.device,
                 );
                 // Biến Invalid actions thành -âm vô cực
-                logits = logits.mask_fill(mask_tensor.bool_not(), -1e9);
+                logits = logits.mask_fill(mask_tensor.clone().bool_not(), -1e9);
 
                 // 🌟 TÍNH XÁC SUẤT SAU KHI ĐÃ MASK (Đồng nhất hoàn toàn với lúc inference)
                 let probs = burn::tensor::activation::softmax(logits.clone(), 1).clamp_min(1e-8);
                 let log_probs_all = burn::tensor::activation::log_softmax(logits, 1);
 
-                let entropy = probs.clone().mul(log_probs_all).sum_dim(1).neg().mean();
+                let entropy_elements = probs.clone().mul(log_probs_all);
+                let valid_entropy = entropy_elements.mask_fill(mask_tensor.bool_not(), 0.0);
+                let entropy = valid_entropy.sum_dim(1).neg().mean();
 
                 let mb_a_i64: Vec<i64> = all_ai_i64
                     [start * head_sizes.len()..end * head_sizes.len()]
@@ -461,7 +465,7 @@ where
                 let safe_probs = probs.gather(1, index_tensor).clamp_min(1e-8);
                 let log_probs_selected = safe_probs.log().reshape([current_batch_size]);
 
-                let policy_loss = log_probs_selected.mul(total_rewards.clone()).neg().mean();
+                let policy_loss = log_probs_selected.mul(advantage.clone()).neg().mean();
                 let head_loss =
                     policy_loss.sub(entropy.clone().mul_scalar(self.entropy_coeff as f64));
                 actor_loss_sum = actor_loss_sum.add(head_loss);
@@ -522,9 +526,6 @@ pub fn create_agent<T: ActionTranslator>(
         ModelArchitecture::Mlp => {
             ActorArchitecture::Mlp(MlpActor::new(&device, input_size, d_model, head_sizes))
         }
-        ModelArchitecture::Transformer => ActorArchitecture::Transformer(TransformerActor::new(
-            &device, input_size, d_model, head_sizes,
-        )),
     };
 
     let total_action_dims: usize = head_sizes.iter().sum();
@@ -536,9 +537,6 @@ pub fn create_agent<T: ActionTranslator>(
             total_action_dims,
             d_model,
         )),
-        ModelArchitecture::Transformer => ForwardArchitecture::Transformer(
-            TransformerForward::new(&device, input_size, total_action_dims, d_model),
-        ),
     };
 
     BurnAgent {
