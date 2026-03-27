@@ -1,4 +1,5 @@
 use crate::models::mlp::MlpActor;
+use crate::models::transformer::TransformerActor; // 🌟
 use crate::models::{ActorArchitecture, ModelArchitecture};
 use burn::backend::{Autodiff, Wgpu};
 use burn::module::AutodiffModule;
@@ -26,6 +27,7 @@ pub struct BurnAgent<T: ActionTranslator, ActorO> {
     pub entropy_coeff: f32,
     pub noise_floor: f32,
     pub batch_size: usize,
+    pub seq_len: usize, // 🌟 BỘ NHỚ THỜI GIAN
 }
 
 #[derive(Clone)]
@@ -34,6 +36,7 @@ pub struct BurnActor<T: ActionTranslator> {
     pub translator: T,
     pub device: <<FuzzBackend as AutodiffBackend>::InnerBackend as Backend>::Device,
     pub noise_floor: f32,
+    pub seq_len: usize, // 🌟
 }
 
 impl<T: ActionTranslator> crate::core::FuzzActor for BurnActor<T> {
@@ -42,90 +45,49 @@ impl<T: ActionTranslator> crate::core::FuzzActor for BurnActor<T> {
 
     fn choose_action(
         &self,
-        state: &Self::State,
+        state_history: &[Self::State],
         masks: &[Vec<bool>],
     ) -> (Self::Action, Vec<usize>, f32) {
-        let state_tensor = Tensor::from_data(
-            TensorData::new(state.clone(), [1, state.len()]),
-            &self.device,
-        );
-        let head_logits = self
-            .actor_net
-            .forward_with_floor(state_tensor, self.noise_floor);
-
-        let mut selected_indices = Vec::new();
-        let mut total_log_prob = 0.0;
-
-        for (i, mut logits) in head_logits.into_iter().enumerate() {
-            let head_size = logits.dims()[1];
-            if !masks[i].is_empty() {
-                let mask_tensor = Tensor::<_, 2, Bool>::from_data(
-                    TensorData::new(masks[i].clone(), [1, head_size]),
-                    &self.device,
-                );
-                logits = logits.mask_fill(mask_tensor.bool_not(), -1e9);
-            }
-
-            let probs = burn::tensor::activation::softmax(logits, 1).clamp_min(1e-8);
-            let probs_vec = probs.into_data().to_vec::<f32>().unwrap();
-            let mut rng = rng();
-
-            let dist_result = WeightedIndex::new(&probs_vec);
-            let chosen_index = match dist_result {
-                Ok(dist) => dist.sample(&mut rng),
-                Err(_) => {
-                    if !masks[i].is_empty() {
-                        let valid: Vec<usize> = masks[i]
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, &v)| v)
-                            .map(|(idx, _)| idx)
-                            .collect();
-                        if !valid.is_empty() {
-                            valid[Uniform::new(0, valid.len()).unwrap().sample(&mut rng)]
-                        } else {
-                            0
-                        }
-                    } else {
-                        Uniform::new(0, head_size).unwrap().sample(&mut rng)
-                    }
-                }
-            };
-
-            selected_indices.push(chosen_index);
-            total_log_prob += probs_vec[chosen_index].max(1e-8).ln();
-        }
-        (
-            self.translator.translate(&selected_indices),
-            selected_indices,
-            total_log_prob,
-        )
+        self.choose_batch_action(&[state_history.to_vec()], &[masks.to_vec()])
+            .pop()
+            .unwrap()
     }
 
     fn choose_batch_action(
         &self,
-        states: &[Self::State],
+        state_histories: &[Vec<Self::State>],
         masks_batch: &[Vec<Vec<bool>>],
     ) -> Vec<(Self::Action, Vec<usize>, f32)> {
-        let batch_size = states.len();
+        let batch_size = state_histories.len();
         if batch_size == 0 {
             return Vec::new();
         }
-        let state_dim = states[0].len();
+        let state_dim = state_histories[0][0].len();
 
-        let mut flattened_states = Vec::with_capacity(batch_size * state_dim);
-        for s in states {
-            flattened_states.extend_from_slice(s);
+        // 🌟 NÉN CHUỖI: BÙ SỐ 0 NẾU THIẾU BƯỚC, CẮT ĐUÔI NẾU THỪA BƯỚC
+        let mut flattened_sequences = Vec::with_capacity(batch_size * self.seq_len * state_dim);
+
+        for history in state_histories {
+            let mut padded = vec![0.0f32; self.seq_len * state_dim];
+            let take_len = history.len().min(self.seq_len);
+            let start_idx = self.seq_len - take_len; // Left padding
+            let hist_start = history.len() - take_len;
+
+            for i in 0..take_len {
+                let offset = (start_idx + i) * state_dim;
+                padded[offset..offset + state_dim].copy_from_slice(&history[hist_start + i]);
+            }
+            flattened_sequences.extend(padded);
         }
 
-        let state_tensor = Tensor::from_data(
-            TensorData::new(flattened_states, [batch_size, state_dim]),
+        let sequence_tensor = Tensor::from_data(
+            TensorData::new(flattened_sequences, [batch_size, self.seq_len, state_dim]),
             &self.device,
         );
 
         let head_logits = self
             .actor_net
-            .forward_with_floor(state_tensor, self.noise_floor);
+            .forward_with_floor(sequence_tensor, self.noise_floor);
         let num_heads = head_logits.len();
 
         let mut heads_probs_vecs = Vec::with_capacity(num_heads);
@@ -217,6 +179,7 @@ where
             translator: self.translator.clone(),
             device: self.device.clone(),
             noise_floor: self.noise_floor,
+            seq_len: self.seq_len, // 🌟
         }
     }
 
@@ -226,14 +189,34 @@ where
     ) {
         let head_sizes = self.actor_net.head_sizes();
 
-        let mut all_s = Vec::new();
+        let mut all_s_seq = Vec::new(); // LƯU CẢ CHUỖI CHO MỖI SAMPLE
         let mut all_ai_i64 = Vec::new();
         let mut all_rewards = Vec::new();
         let mut all_masks_by_head: Vec<Vec<bool>> = vec![Vec::new(); head_sizes.len()];
 
+        let state_dim = if !trajectories.is_empty() && !trajectories[0].states.is_empty() {
+            trajectories[0].states[0].len()
+        } else {
+            return;
+        };
+
         for t in trajectories.iter().filter(|t| !t.action_indices.is_empty()) {
             for i in 0..t.action_indices.len() {
-                all_s.extend_from_slice(&t.states[i]); // Lấy State TRƯỚC khi action
+                // 🌟 Lấy lịch sử từ bước 0 đến bước thứ i
+                let current_hist = &t.states[0..=i];
+                let mut padded_history = vec![0.0; self.seq_len * state_dim];
+
+                let take_len = current_hist.len().min(self.seq_len);
+                let start_idx = self.seq_len - take_len;
+                let hist_start = current_hist.len() - take_len;
+
+                for step in 0..take_len {
+                    let offset = (start_idx + step) * state_dim;
+                    padded_history[offset..offset + state_dim]
+                        .copy_from_slice(&current_hist[hist_start + step]);
+                }
+
+                all_s_seq.extend(padded_history);
                 all_ai_i64.extend(t.action_indices[i].iter().map(|&idx| idx as i64));
                 all_rewards.push(t.reward);
 
@@ -247,14 +230,12 @@ where
             }
         }
 
-        if all_s.is_empty() {
+        if all_rewards.is_empty() {
             return;
         }
 
         let total_steps = all_rewards.len();
-        let state_dim = trajectories[0].states[0].len();
         let num_batches = (total_steps + self.batch_size - 1) / self.batch_size;
-
         let mut avg_actor_loss = 0.0;
         let mut avg_entropy = 0.0;
 
@@ -263,11 +244,13 @@ where
             let end = (start + self.batch_size).min(total_steps);
             let current_batch_size = end - start;
 
-            let mb_s = all_s[start * state_dim..end * state_dim].to_vec();
+            let mb_s_seq = all_s_seq
+                [start * self.seq_len * state_dim..end * self.seq_len * state_dim]
+                .to_vec();
             let mb_rew = all_rewards[start..end].to_vec();
 
-            let s_tens = Tensor::<FuzzBackend, 2>::from_data(
-                TensorData::new(mb_s, [current_batch_size, state_dim]),
+            let s_tens = Tensor::<FuzzBackend, 3>::from_data(
+                TensorData::new(mb_s_seq, [current_batch_size, self.seq_len, state_dim]),
                 &self.device,
             );
 
@@ -276,7 +259,6 @@ where
                 &self.device,
             );
 
-            // 🌟 TÍNH ADVANTAGE TRỰC TIẾP TỪ REWARD ĐỘ PHỦ
             let mean_reward = ext_rew_tens.clone().mean();
             let advantage = ext_rew_tens.sub(mean_reward).detach();
 
@@ -357,13 +339,23 @@ pub fn create_agent<T: ActionTranslator>(
     entropy_coeff: f32,
     noise_floor: f32,
     batch_size: usize,
+    seq_len: usize, // 🌟 TRUYỀN PARAMETER BỘ NHỚ
 ) -> BurnAgent<T, impl Optimizer<ActorArchitecture<FuzzBackend>, FuzzBackend>> {
     let device = <FuzzBackend as Backend>::Device::default();
 
     let actor_net = match arch {
         ModelArchitecture::Mlp => {
-            ActorArchitecture::Mlp(MlpActor::new(&device, input_size, d_model, head_sizes))
+            // MLP nhận mảng đã bị làm bẹp: Số chiều State x Chiều dài chuỗi
+            ActorArchitecture::Mlp(MlpActor::new(
+                &device,
+                input_size * seq_len,
+                d_model,
+                head_sizes,
+            ))
         }
+        ModelArchitecture::Transformer => ActorArchitecture::Transformer(TransformerActor::new(
+            &device, input_size, d_model, head_sizes, seq_len,
+        )),
     };
 
     BurnAgent {
@@ -376,5 +368,6 @@ pub fn create_agent<T: ActionTranslator>(
         entropy_coeff,
         noise_floor,
         batch_size,
+        seq_len, // 🌟
     }
 }
