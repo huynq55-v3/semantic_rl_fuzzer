@@ -36,10 +36,22 @@ pub struct Trajectory<S, A> {
     pub is_interesting: bool,
 }
 
+// 🌟 BẢN FIX VÔ THƯỢNG: Lưu trữ toàn bộ "linh hồn" của ván game
+#[derive(Clone, Debug)]
+pub struct SavedSeed<E: FuzzEnvironment> {
+    pub env: E,
+    pub states_history: Vec<E::State>,
+    pub actions_history: Vec<E::Action>,
+    pub action_indices_history: Vec<Vec<usize>>,
+    pub masks_history: Vec<Vec<Vec<bool>>>,
+    pub log_probs_history: Vec<f32>, // Cần thiết để hàm learn_from_batch không bị crash
+    pub accumulated_reward: f32,
+}
+
 pub struct FuzzCorpus<E: FuzzEnvironment> {
     pub interesting_seeds: Vec<Trajectory<E::State, E::Action>>,
     pub seen_states: HashSet<u64>,
-    pub saved_envs: Vec<E>,
+    pub saved_envs: Vec<SavedSeed<E>>,
 }
 
 impl<E: FuzzEnvironment> FuzzCorpus<E> {
@@ -73,13 +85,13 @@ pub trait FuzzActor: Send + Clone {
 
     fn choose_action(
         &self,
-        state_history: &[Self::State], // 🌟 Nhận Lịch sử thay vì 1 State
+        state_history: &[Self::State],
         masks: &[Vec<bool>],
     ) -> (Self::Action, Vec<usize>, f32);
 
     fn choose_batch_action(
         &self,
-        state_histories: &[Vec<Self::State>], // 🌟 Nhận Batch Lịch sử
+        state_histories: &[Vec<Self::State>],
         masks_batch: &[Vec<Vec<bool>>],
     ) -> Vec<(Self::Action, Vec<usize>, f32)>;
 }
@@ -139,14 +151,6 @@ where
 
             let mut envs: Vec<E> = vec![self.base_env.clone(); num_envs];
 
-            for env in envs.iter_mut() {
-                if !self.corpus.saved_envs.is_empty() && rng.random_bool(0.5) {
-                    *env = self.corpus.saved_envs.choose(&mut rng).unwrap().clone();
-                } else {
-                    env.reset();
-                }
-            }
-
             let mut rollouts: Vec<Trajectory<E::State, E::Action>> = vec![
                 Trajectory {
                     states: Vec::with_capacity(max_steps + 1),
@@ -160,13 +164,33 @@ where
                 num_envs
             ];
 
+            // 🌟 KHÔI PHỤC KÝ ỨC (Amnesia Fix)
+            for i in 0..num_envs {
+                let env = &mut envs[i];
+                let traj = &mut rollouts[i];
+
+                if !self.corpus.saved_envs.is_empty() && rng.random_bool(0.5) {
+                    let seed = self.corpus.saved_envs.choose(&mut rng).unwrap();
+                    *env = seed.env.clone();
+
+                    // Khôi phục đồng bộ mọi mảng dữ liệu
+                    traj.states = seed.states_history.clone();
+                    traj.actions = seed.actions_history.clone();
+                    traj.action_indices = seed.action_indices_history.clone();
+                    traj.masks = seed.masks_history.clone();
+                    traj.log_probs = seed.log_probs_history.clone();
+                    traj.reward = seed.accumulated_reward;
+                } else {
+                    env.reset();
+                }
+            }
+
             let mut active_mask = vec![true; num_envs];
 
             for _step in 0..max_steps {
                 let current_states: Vec<E::State> =
                     envs.par_iter().map(|e| e.get_state()).collect();
 
-                // 🌟 LẤY TOÀN BỘ LỊCH SỬ TỪ ĐẦU VÁN GAME ĐẾN HIỆN TẠI
                 let current_histories: Vec<Vec<E::State>> = rollouts
                     .iter()
                     .zip(current_states.iter())
@@ -180,7 +204,6 @@ where
                 let current_masks: Vec<Vec<Vec<bool>>> =
                     envs.par_iter().map(|e| e.get_action_mask()).collect();
 
-                // Ném cả chuỗi thời gian vào Mạng Neural
                 let batch_results = actor.choose_batch_action(&current_histories, &current_masks);
 
                 let step_results: Vec<_> = envs
@@ -219,6 +242,8 @@ where
                     {
                         let traj = &mut rollouts[i];
 
+                        // Chỉ push s_before nếu traj.states đang rỗng (mới reset)
+                        // Nếu load từ Seed, traj.states đã có dữ liệu, ta không push s_before nữa
                         if traj.states.is_empty() {
                             traj.states.push(s_before);
                         }
@@ -227,13 +252,23 @@ where
                         traj.action_indices.push(idx);
                         traj.masks.push(mask);
                         traj.log_probs.push(lp);
-                        traj.states.push(s_next.clone());
+                        traj.states.push(s_next.clone()); // Push state mới vào cuối mảng
 
                         let hash_val = E::hash_state(&s_next);
                         if self.corpus.seen_states.insert(hash_val) {
                             traj.reward += 1.0;
                             traj.is_interesting = true;
-                            self.corpus.saved_envs.push(env_snapshot);
+
+                            // 🌟 LƯU TOÀN BỘ LINH HỒN
+                            self.corpus.saved_envs.push(SavedSeed {
+                                env: env_snapshot,
+                                states_history: traj.states.clone(),
+                                actions_history: traj.actions.clone(),
+                                action_indices_history: traj.action_indices.clone(),
+                                masks_history: traj.masks.clone(),
+                                log_probs_history: traj.log_probs.clone(),
+                                accumulated_reward: traj.reward,
+                            });
                         }
 
                         match status {
@@ -264,6 +299,7 @@ where
             let mut total_steps_taken = 0;
 
             for (i, traj) in rollouts.iter_mut().enumerate() {
+                // Tổng số bước đi sẽ tính dựa trên chiều dài của mảng actions
                 total_steps_taken += traj.actions.len();
                 total_batch_reward += traj.reward;
                 if traj.reward > 0.0 {
@@ -277,12 +313,17 @@ where
                     if traj.reward <= -1.0 || traj.states.is_empty() {
                         crashes_found += 1;
                         let filename = format!("artifacts/bug_iter_{}_env_{}.txt", iteration, i);
-                        let content = format!("Action sequence:\n{:#?}", traj.actions);
+                        let content = format!(
+                            "Action sequence (Length: {}):\n{:#?}",
+                            traj.actions.len(),
+                            traj.actions
+                        );
                         let _ = artifact_tx.send((filename, content));
                     }
                 }
             }
 
+            // Gửi dữ liệu ĐỒNG BỘ TUYỆT ĐỐI cho NeuralAgent học
             self.agent.learn_from_batch(&rollouts);
 
             if iteration % self.config.log_interval == 0 {
