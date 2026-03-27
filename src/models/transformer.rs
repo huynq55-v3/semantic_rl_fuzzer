@@ -74,7 +74,7 @@ impl<B: Backend> TransformerActor<B> {
 
         let last_token_feature = x
             .slice([0..batch, seq_len - 1..seq_len, 0..d_model_inner])
-            .squeeze::<2>();
+            .reshape([batch, d_model_inner]);
 
         self.heads
             .iter()
