@@ -68,8 +68,12 @@ impl<B: Backend> TransformerActor<B> {
         let x = self.layer_norm.forward(x + attn_out);
 
         // 3. 🌟 GOM KẾT QUẢ TỪ BƯỚC THỜI GIAN CUỐI CÙNG (HIỆN TẠI)
+        // Lấy kích thước ra trước để tránh lỗi "borrow of moved value"
+        let dims = x.dims();
+        let d_model_inner = dims[2];
+
         let last_token_feature = x
-            .slice([0..batch, seq_len - 1..seq_len, 0..x.dims()[2]])
+            .slice([0..batch, seq_len - 1..seq_len, 0..d_model_inner])
             .squeeze::<2>();
 
         self.heads
