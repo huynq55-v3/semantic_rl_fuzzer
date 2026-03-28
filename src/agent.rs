@@ -2,7 +2,7 @@ use crate::models::mlp::MlpActor;
 use crate::models::transformer::TransformerActor; // 🌟
 use crate::models::{ActorArchitecture, ModelArchitecture};
 use burn::backend::{Autodiff, Wgpu};
-use burn::module::AutodiffModule;
+use burn::module::{AutodiffModule, Module, Param, ParamId};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::tensor::backend::AutodiffBackend;
@@ -12,19 +12,28 @@ use rayon::prelude::*;
 
 pub type FuzzBackend = Autodiff<Wgpu>;
 
+// 🌟 ĐỊNH NGHĨA MẠNG META-CONTROLLER (CHỈ CÓ 1 PARAMETER DUY NHẤT)
+#[derive(Module, Debug)]
+pub struct Temperature<B: Backend> {
+    pub log_alpha: Param<Tensor<B, 1>>,
+}
+
 pub trait ActionTranslator: Send + Sync + Clone {
     type TargetAction: Send + Sync + Clone + std::fmt::Debug;
     fn translate(&self, head_outputs: &[usize]) -> Self::TargetAction;
 }
 
-pub struct BurnAgent<T: ActionTranslator, ActorO> {
+pub struct BurnAgent<T: ActionTranslator, ActorO, TempO> {
+    // 🌟 Thêm TempO
     pub actor_net: ActorArchitecture<FuzzBackend>,
     pub actor_opt: ActorO,
+    pub temperature: Temperature<FuzzBackend>, // 🌟 Tham số tự học
+    pub temp_opt: TempO,                       // 🌟 Optimizer riêng cho nó
     pub translator: T,
     pub learning_rate: f64,
     pub d_model: usize,
     pub device: <FuzzBackend as Backend>::Device,
-    pub entropy_coeff: f32,
+    pub target_entropy: f32, // 🌟 Đích đến thay cho coeff cứng
     pub noise_floor: f32,
     pub batch_size: usize,
     pub seq_len: usize, // 🌟 BỘ NHỚ THỜI GIAN
@@ -165,9 +174,10 @@ impl<T: ActionTranslator> crate::core::FuzzActor for BurnActor<T> {
     }
 }
 
-impl<T: ActionTranslator, ActorO> crate::core::NeuralAgent for BurnAgent<T, ActorO>
+impl<T: ActionTranslator, ActorO, TempO> crate::core::NeuralAgent for BurnAgent<T, ActorO, TempO>
 where
     ActorO: Optimizer<ActorArchitecture<FuzzBackend>, FuzzBackend>,
+    TempO: Optimizer<Temperature<FuzzBackend>, FuzzBackend>, // 🌟 ĐK cho Temp Optimizer
 {
     type State = Vec<f32>;
     type Action = T::TargetAction;
@@ -265,6 +275,11 @@ where
             let all_head_logits = self.actor_net.forward_with_floor(s_tens, self.noise_floor);
             let mut actor_loss_sum = Tensor::<FuzzBackend, 1>::from_data([0.0], &self.device);
 
+            // 🌟 Lấy hệ số Alpha từ Mạng Temperature (Detach để không dính Gradient của Actor)
+            let log_alpha = self.temperature.log_alpha.val();
+            let alpha_detached = log_alpha.clone().exp().detach();
+            let mut batch_entropy_sum = 0.0;
+
             for (h, mut logits) in all_head_logits.into_iter().enumerate() {
                 let h_size = head_sizes[h];
                 let mb_mask = &all_masks_by_head[h][start * h_size..end * h_size];
@@ -300,16 +315,19 @@ where
                 let log_probs_selected = safe_probs.log().reshape([current_batch_size]);
 
                 let policy_loss = log_probs_selected.mul(advantage.clone()).neg().mean();
-                let head_loss =
-                    policy_loss.sub(entropy.clone().mul_scalar(self.entropy_coeff as f64));
+
+                // 🌟 Trừ đi Entropy nhân với Alpha đã detach (Chỉ cập nhật Actor)
+                let head_loss = policy_loss.sub(entropy.clone().mul(alpha_detached.clone()));
                 actor_loss_sum = actor_loss_sum.add(head_loss);
 
-                avg_entropy +=
-                    entropy.into_data().to_vec::<f32>().unwrap()[0] / (head_sizes.len() as f32);
+                let head_ent_val = entropy.into_data().to_vec::<f32>().unwrap()[0];
+                avg_entropy += head_ent_val / (head_sizes.len() as f32);
+                batch_entropy_sum += head_ent_val;
             }
 
             avg_actor_loss += actor_loss_sum.clone().into_data().to_vec::<f32>().unwrap()[0];
 
+            // 🌟 1. CẬP NHẬT MẠNG CHÍNH (ACTOR)
             let actor_grads = actor_loss_sum.backward();
             let actor_grads_params = GradientsParams::from_grads(actor_grads, &self.actor_net);
             self.actor_net = self.actor_opt.step(
@@ -317,14 +335,37 @@ where
                 self.actor_net.clone(),
                 actor_grads_params,
             );
+
+            // 🌟 2. CẬP NHẬT MẠNG META (TEMPERATURE AUTO-TUNING)
+            let current_batch_entropy = batch_entropy_sum / (head_sizes.len() as f32);
+            // Hàm Loss Toán học của SAC: Loss = log_alpha * (Current_Entropy - Target_Entropy)
+            let temp_loss =
+                log_alpha.mul_scalar((current_batch_entropy - self.target_entropy) as f64);
+            let temp_grads = temp_loss.backward();
+            let temp_grads_params = GradientsParams::from_grads(temp_grads, &self.temperature);
+            self.temperature = self.temp_opt.step(
+                self.learning_rate, // Dung chung Learning Rate cũng ổn
+                self.temperature.clone(),
+                temp_grads_params,
+            );
         }
 
         avg_actor_loss /= num_batches as f32;
         avg_entropy /= num_batches as f32;
 
+        // 🌟 Chuyển đổi log_alpha thành coeff thực tế để in Log
+        let current_coeff = self
+            .temperature
+            .log_alpha
+            .val()
+            .exp()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap()[0];
+
         println!(
-            "🔥 [Actor] {:>5} steps học | Loss: {:>7.4} | Entropy: {:>5.4}",
-            total_steps, avg_actor_loss, avg_entropy
+            "🔥 [Actor] {:>5} steps | Loss: {:>7.4} | Ent: {:>5.4} (Target: {:.2}) | Auto-Coeff: {:.4}",
+            total_steps, avg_actor_loss, avg_entropy, self.target_entropy, current_coeff
         );
     }
 }
@@ -336,11 +377,16 @@ pub fn create_agent<T: ActionTranslator>(
     head_sizes: &[usize],
     learning_rate: f64,
     translator: T,
-    entropy_coeff: f32,
+    target_entropy: f32, // 🌟 Mục tiêu tự động
+    initial_coeff: f32,  // 🌟 Mức Coeff khởi tạo (VD: 0.25)
     noise_floor: f32,
     batch_size: usize,
-    seq_len: usize, // 🌟 TRUYỀN PARAMETER BỘ NHỚ
-) -> BurnAgent<T, impl Optimizer<ActorArchitecture<FuzzBackend>, FuzzBackend>> {
+    seq_len: usize,
+) -> BurnAgent<
+    T,
+    impl Optimizer<ActorArchitecture<FuzzBackend>, FuzzBackend>,
+    impl Optimizer<Temperature<FuzzBackend>, FuzzBackend>, // 🌟
+> {
     let device = <FuzzBackend as Backend>::Device::default();
 
     let actor_net = match arch {
@@ -358,16 +404,28 @@ pub fn create_agent<T: ActionTranslator>(
         )),
     };
 
+    // Khởi tạo tham số log_alpha để nó tự học tiến hóa
+    let log_alpha_val = initial_coeff.ln();
+    let log_alpha_tensor =
+        Tensor::<FuzzBackend, 1>::from_data([log_alpha_val], &device).require_grad();
+
+    let temperature = Temperature {
+        // 🌟 Dùng Param::initialized và cấp cho nó một cái ID độc nhất
+        log_alpha: Param::initialized(ParamId::new(), log_alpha_tensor),
+    };
+
     BurnAgent {
         actor_net,
         actor_opt: AdamConfig::new().init(),
+        temperature,                        // 🌟
+        temp_opt: AdamConfig::new().init(), // 🌟
         translator,
         learning_rate,
         d_model,
-        device,
-        entropy_coeff,
+        device: device.clone(),
+        target_entropy, // 🌟
         noise_floor,
         batch_size,
-        seq_len, // 🌟
+        seq_len,
     }
 }
