@@ -11,6 +11,7 @@ pub struct FuzzConfig {
     pub max_steps_per_episode: usize,
     pub total_iterations: usize,
     pub log_interval: usize,
+    pub max_corpus_size: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +272,17 @@ where
                                 log_probs_history: traj.log_probs.clone(),
                                 accumulated_reward: traj.reward,
                             });
+                        }
+
+                        if self.corpus.saved_envs.len() > self.config.max_corpus_size {
+                            // Sắp xếp: Ưu tiên những Seed có reward cao nhất lên đầu
+                            self.corpus.saved_envs.sort_by(|a, b| {
+                                b.accumulated_reward
+                                    .partial_cmp(&a.accumulated_reward)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            // Cắt bỏ những Seed "yếu kém" ở cuối danh sách để giữ đúng kích thước quy định
+                            self.corpus.saved_envs.truncate(self.config.max_corpus_size);
                         }
 
                         match status {
