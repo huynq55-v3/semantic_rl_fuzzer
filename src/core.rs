@@ -51,7 +51,6 @@ pub struct SavedSeed<E: FuzzEnvironment> {
 }
 
 pub struct FuzzCorpus<E: FuzzEnvironment> {
-    pub interesting_seeds: Vec<Trajectory<E::State, E::Action>>,
     pub seen_states: HashSet<u64>,
     pub saved_envs: Vec<SavedSeed<E>>,
 }
@@ -59,7 +58,6 @@ pub struct FuzzCorpus<E: FuzzEnvironment> {
 impl<E: FuzzEnvironment> FuzzCorpus<E> {
     pub fn new() -> Self {
         Self {
-            interesting_seeds: Vec::new(),
             seen_states: HashSet::new(),
             saved_envs: Vec::new(),
         }
@@ -146,9 +144,6 @@ where
 
         for iteration in 1..=self.config.total_iterations {
             let start_time = Instant::now();
-
-            // 🚩 Dọn dẹp interesting_seeds mỗi vòng lặp để tránh phình RAM vô tận
-            self.corpus.interesting_seeds.clear();
 
             let actor = self.agent.get_actor();
             let oracle_ref = &self.oracle;
@@ -331,9 +326,6 @@ where
                 }
 
                 if traj.is_interesting {
-                    if !traj.reward.is_nan() {
-                        self.corpus.interesting_seeds.push(traj.clone());
-                    }
                     if traj.reward <= -1.0 || traj.states.is_empty() {
                         crashes_found += 1;
                         let filename = format!("artifacts/bug_iter_{}_env_{}.txt", iteration, i);

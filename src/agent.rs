@@ -8,8 +8,9 @@ use burn::prelude::*;
 use burn::tensor::backend::AutodiffBackend;
 use rand::distr::{weighted::WeightedIndex, Distribution, Uniform};
 use rand::rng;
-use std::sync::Arc;
+use rand::seq::SliceRandom;
 use rayon::prelude::*;
+use std::sync::Arc;
 
 pub type FuzzBackend = Autodiff<Wgpu>;
 
@@ -221,6 +222,24 @@ where
             return;
         }
 
+        // 🌟 TỐI ƯU 1: XÀO BÀI (SHUFFLE) DỮ LIỆU ĐỂ TRÁNH HỌC VẸT
+        let mut rng = rng();
+        all_samples.shuffle(&mut rng);
+
+        // 🌟 TỐI ƯU 2: TÍNH GLOBAL ADVANTAGE (CỨU RỖI NÃO BỘ CỦA AGENT)
+        let total_samples = all_samples.len() as f32;
+        let mut global_reward_sum = 0.0;
+        for (t, _) in &all_samples {
+            global_reward_sum += t.reward;
+        }
+        let global_mean = global_reward_sum / total_samples;
+
+        let mut variance_sum = 0.0;
+        for (t, _) in &all_samples {
+            variance_sum += (t.reward - global_mean).powi(2);
+        }
+        let global_std = (variance_sum / total_samples).sqrt().max(1e-8);
+
         let mut total_processed_steps = 0;
         let mut accumulated_actor_loss = 0.0;
         let mut accumulated_entropy = 0.0;
@@ -269,13 +288,17 @@ where
                 &self.device,
             );
 
-            let ext_rew_tens = Tensor::<FuzzBackend, 1>::from_data(
-                TensorData::new(mb_rewards, [current_batch_size]),
-                &self.device,
-            );
+            let mut mb_advantages = Vec::with_capacity(current_batch_size);
+            for (t, _) in chunk {
+                let adv = (t.reward - global_mean) / global_std;
+                mb_advantages.push(adv);
+            }
 
-            let mean_reward = ext_rew_tens.clone().mean();
-            let advantage = ext_rew_tens.sub(mean_reward).detach();
+            let advantage = Tensor::<FuzzBackend, 1>::from_data(
+                TensorData::new(mb_advantages, [current_batch_size]),
+                &self.device,
+            )
+            .detach();
 
             let all_head_logits = self.actor_net.forward_with_floor(s_tens, self.noise_floor);
             let mut actor_loss_sum = Tensor::<FuzzBackend, 1>::from_data([0.0], &self.device);
