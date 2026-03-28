@@ -8,6 +8,7 @@ use burn::prelude::*;
 use burn::tensor::backend::AutodiffBackend;
 use rand::distr::{weighted::WeightedIndex, Distribution, Uniform};
 use rand::rng;
+use std::sync::Arc;
 use rayon::prelude::*;
 
 pub type FuzzBackend = Autodiff<Wgpu>;
@@ -49,7 +50,7 @@ pub struct BurnActor<T: ActionTranslator> {
 }
 
 impl<T: ActionTranslator> crate::core::FuzzActor for BurnActor<T> {
-    type State = Vec<f32>;
+    type State = Arc<Vec<f32>>;
     type Action = T::TargetAction;
 
     fn choose_action(
@@ -177,11 +178,15 @@ impl<T: ActionTranslator> crate::core::FuzzActor for BurnActor<T> {
 impl<T: ActionTranslator, ActorO, TempO> crate::core::NeuralAgent for BurnAgent<T, ActorO, TempO>
 where
     ActorO: Optimizer<ActorArchitecture<FuzzBackend>, FuzzBackend>,
-    TempO: Optimizer<Temperature<FuzzBackend>, FuzzBackend>, // 🌟 ĐK cho Temp Optimizer
+    TempO: Optimizer<Temperature<FuzzBackend>, FuzzBackend>,
 {
-    type State = Vec<f32>;
+    type State = Arc<Vec<f32>>;
     type Action = T::TargetAction;
     type Actor = BurnActor<T>;
+
+    fn seq_len(&self) -> usize {
+        self.seq_len
+    }
 
     fn get_actor(&self) -> Self::Actor {
         BurnActor {
@@ -198,22 +203,42 @@ where
         trajectories: &[crate::core::Trajectory<Self::State, Self::Action>],
     ) {
         let head_sizes = self.actor_net.head_sizes();
-
-        let mut all_s_seq = Vec::new(); // LƯU CẢ CHUỖI CHO MỖI SAMPLE
-        let mut all_ai_i64 = Vec::new();
-        let mut all_rewards = Vec::new();
-        let mut all_masks_by_head: Vec<Vec<bool>> = vec![Vec::new(); head_sizes.len()];
-
         let state_dim = if !trajectories.is_empty() && !trajectories[0].states.is_empty() {
             trajectories[0].states[0].len()
         } else {
             return;
         };
 
+        // 🚩 BẢN FIX VÀNG: Gom toàn bộ samples vào một list phẳng để chia batch ổn định
+        let mut all_samples = Vec::new();
         for t in trajectories.iter().filter(|t| !t.action_indices.is_empty()) {
             for i in 0..t.action_indices.len() {
-                // 🌟 Lấy lịch sử từ bước 0 đến bước thứ i
-                let current_hist = &t.states[0..=i];
+                all_samples.push((t, i));
+            }
+        }
+
+        if all_samples.is_empty() {
+            return;
+        }
+
+        let mut total_processed_steps = 0;
+        let mut accumulated_actor_loss = 0.0;
+        let mut accumulated_entropy = 0.0;
+        let mut num_updates = 0;
+
+        // 🌟 CHUNK DỰA TRÊN self.batch_size (Thay vì hardcode 64 trajectories)
+        for chunk in all_samples.chunks(self.batch_size) {
+            let current_batch_size = chunk.len();
+            total_processed_steps += current_batch_size;
+
+            let mut mb_s_seq = Vec::with_capacity(current_batch_size * self.seq_len * state_dim);
+            let mut mb_ai_i64 = Vec::with_capacity(current_batch_size * head_sizes.len());
+            let mut mb_rewards = Vec::with_capacity(current_batch_size);
+            let mut mb_masks_by_head: Vec<Vec<bool>> = vec![Vec::new(); head_sizes.len()];
+
+            for (t, i) in chunk {
+                let step_idx = *i;
+                let current_hist = &t.states[0..=step_idx];
                 let mut padded_history = vec![0.0; self.seq_len * state_dim];
 
                 let take_len = current_hist.len().min(self.seq_len);
@@ -226,38 +251,18 @@ where
                         .copy_from_slice(&current_hist[hist_start + step]);
                 }
 
-                all_s_seq.extend(padded_history);
-                all_ai_i64.extend(t.action_indices[i].iter().map(|&idx| idx as i64));
-                all_rewards.push(t.reward);
+                mb_s_seq.extend(padded_history);
+                mb_ai_i64.extend(t.action_indices[step_idx].iter().map(|&idx| idx as i64));
+                mb_rewards.push(t.reward);
 
                 for h in 0..head_sizes.len() {
-                    if t.masks[i][h].is_empty() {
-                        all_masks_by_head[h].extend(std::iter::repeat(true).take(head_sizes[h]));
+                    if t.masks[step_idx][h].is_empty() {
+                        mb_masks_by_head[h].extend(std::iter::repeat(true).take(head_sizes[h]));
                     } else {
-                        all_masks_by_head[h].extend(&t.masks[i][h]);
+                        mb_masks_by_head[h].extend(&t.masks[step_idx][h]);
                     }
                 }
             }
-        }
-
-        if all_rewards.is_empty() {
-            return;
-        }
-
-        let total_steps = all_rewards.len();
-        let num_batches = (total_steps + self.batch_size - 1) / self.batch_size;
-        let mut avg_actor_loss = 0.0;
-        let mut avg_entropy = 0.0;
-
-        for b in 0..num_batches {
-            let start = b * self.batch_size;
-            let end = (start + self.batch_size).min(total_steps);
-            let current_batch_size = end - start;
-
-            let mb_s_seq = all_s_seq
-                [start * self.seq_len * state_dim..end * self.seq_len * state_dim]
-                .to_vec();
-            let mb_rew = all_rewards[start..end].to_vec();
 
             let s_tens = Tensor::<FuzzBackend, 3>::from_data(
                 TensorData::new(mb_s_seq, [current_batch_size, self.seq_len, state_dim]),
@@ -265,7 +270,7 @@ where
             );
 
             let ext_rew_tens = Tensor::<FuzzBackend, 1>::from_data(
-                TensorData::new(mb_rew, [current_batch_size]),
+                TensorData::new(mb_rewards, [current_batch_size]),
                 &self.device,
             );
 
@@ -275,14 +280,13 @@ where
             let all_head_logits = self.actor_net.forward_with_floor(s_tens, self.noise_floor);
             let mut actor_loss_sum = Tensor::<FuzzBackend, 1>::from_data([0.0], &self.device);
 
-            // 🌟 Lấy hệ số Alpha từ Mạng Temperature (Detach để không dính Gradient của Actor)
             let log_alpha = self.temperature.log_alpha.val();
             let alpha_detached = log_alpha.clone().exp().detach();
             let mut batch_entropy_sum = 0.0;
 
             for (h, mut logits) in all_head_logits.into_iter().enumerate() {
                 let h_size = head_sizes[h];
-                let mb_mask = &all_masks_by_head[h][start * h_size..end * h_size];
+                let mb_mask = &mb_masks_by_head[h];
 
                 let mask_tensor = Tensor::<FuzzBackend, 2, Bool>::from_data(
                     TensorData::new(mb_mask.to_vec(), [current_batch_size, h_size]),
@@ -298,8 +302,7 @@ where
                 let valid_entropy = entropy_elements.mask_fill(mask_tensor.bool_not(), 0.0);
                 let entropy = valid_entropy.sum_dim(1).neg().mean();
 
-                let mb_a_i64: Vec<i64> = all_ai_i64
-                    [start * head_sizes.len()..end * head_sizes.len()]
+                let mb_a_i64_head: Vec<i64> = mb_ai_i64
                     .iter()
                     .skip(h)
                     .step_by(head_sizes.len())
@@ -307,7 +310,7 @@ where
                     .collect();
 
                 let index_tensor = Tensor::<FuzzBackend, 2, burn::tensor::Int>::from_data(
-                    TensorData::new(mb_a_i64, [current_batch_size, 1]),
+                    TensorData::new(mb_a_i64_head, [current_batch_size, 1]),
                     &self.device,
                 );
 
@@ -315,19 +318,17 @@ where
                 let log_probs_selected = safe_probs.log().reshape([current_batch_size]);
 
                 let policy_loss = log_probs_selected.mul(advantage.clone()).neg().mean();
-
-                // 🌟 Trừ đi Entropy nhân với Alpha đã detach (Chỉ cập nhật Actor)
                 let head_loss = policy_loss.sub(entropy.clone().mul(alpha_detached.clone()));
                 actor_loss_sum = actor_loss_sum.add(head_loss);
 
                 let head_ent_val = entropy.into_data().to_vec::<f32>().unwrap()[0];
-                avg_entropy += head_ent_val / (head_sizes.len() as f32);
                 batch_entropy_sum += head_ent_val;
             }
 
-            avg_actor_loss += actor_loss_sum.clone().into_data().to_vec::<f32>().unwrap()[0];
+            accumulated_entropy += batch_entropy_sum / (head_sizes.len() as f32);
+            accumulated_actor_loss += actor_loss_sum.clone().into_data().to_vec::<f32>().unwrap()[0];
+            num_updates += 1;
 
-            // 🌟 1. CẬP NHẬT MẠNG CHÍNH (ACTOR)
             let actor_grads = actor_loss_sum.backward();
             let actor_grads_params = GradientsParams::from_grads(actor_grads, &self.actor_net);
             self.actor_net = self.actor_opt.step(
@@ -336,24 +337,25 @@ where
                 actor_grads_params,
             );
 
-            // 🌟 2. CẬP NHẬT MẠNG META (TEMPERATURE AUTO-TUNING)
             let current_batch_entropy = batch_entropy_sum / (head_sizes.len() as f32);
-            // Hàm Loss Toán học của SAC: Loss = log_alpha * (Current_Entropy - Target_Entropy)
             let temp_loss =
                 log_alpha.mul_scalar((current_batch_entropy - self.target_entropy) as f64);
             let temp_grads = temp_loss.backward();
             let temp_grads_params = GradientsParams::from_grads(temp_grads, &self.temperature);
             self.temperature = self.temp_opt.step(
-                self.learning_rate, // Dung chung Learning Rate cũng ổn
+                self.learning_rate,
                 self.temperature.clone(),
                 temp_grads_params,
             );
         }
 
-        avg_actor_loss /= num_batches as f32;
-        avg_entropy /= num_batches as f32;
+        if num_updates == 0 {
+            return;
+        }
 
-        // 🌟 Chuyển đổi log_alpha thành coeff thực tế để in Log
+        let avg_actor_loss = accumulated_actor_loss / num_updates as f32;
+        let avg_entropy = accumulated_entropy / num_updates as f32;
+
         let current_coeff = self
             .temperature
             .log_alpha
@@ -365,7 +367,7 @@ where
 
         println!(
             "🔥 [Actor] {:>5} steps | Loss: {:>7.4} | Ent: {:>5.4} (Target: {:.2}) | Auto-Coeff: {:.4}",
-            total_steps, avg_actor_loss, avg_entropy, self.target_entropy, current_coeff
+            total_processed_steps, avg_actor_loss, avg_entropy, self.target_entropy, current_coeff
         );
     }
 }

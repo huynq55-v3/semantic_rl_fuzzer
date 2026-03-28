@@ -105,6 +105,7 @@ pub trait NeuralAgent: Send {
 
     fn get_actor(&self) -> Self::Actor;
     fn learn_from_batch(&mut self, trajectories: &[Trajectory<Self::State, Self::Action>]);
+    fn seq_len(&self) -> usize; // 🌟 Trả về seq_len của agent để tối ưu history window
 }
 
 pub struct FuzzEngine<
@@ -145,6 +146,9 @@ where
 
         for iteration in 1..=self.config.total_iterations {
             let start_time = Instant::now();
+
+            // 🚩 Dọn dẹp interesting_seeds mỗi vòng lặp để tránh phình RAM vô tận
+            self.corpus.interesting_seeds.clear();
 
             let actor = self.agent.get_actor();
             let oracle_ref = &self.oracle;
@@ -194,11 +198,16 @@ where
                 let current_states: Vec<E::State> =
                     envs.par_iter().map(|e| e.get_state()).collect();
 
+                let seq_len = self.agent.seq_len();
                 let current_histories: Vec<Vec<E::State>> = rollouts
                     .iter()
                     .zip(current_states.iter())
                     .map(|(t, s)| {
-                        let mut hist = t.states.clone();
+                        // 🚩 Tối ưu: Chỉ clone seq_len - 1 bước cuối cùng thay vì toàn bộ lịch sử
+                        let take_len = t.states.len().min(seq_len - 1);
+                        let mut hist = Vec::with_capacity(take_len + 1);
+                        let start_idx = t.states.len().saturating_sub(seq_len - 1);
+                        hist.extend(t.states[start_idx..].iter().cloned());
                         hist.push(s.clone());
                         hist
                     })
